@@ -54,7 +54,7 @@ export const ApprovalModeIndicator: React.FC<ApprovalModeIndicatorProps> = ({
     default:
       textColor = theme.text.accent;
       textContent = '';
-      subText = APPROVAL_MODE_TEXT.HINT_SWITCH_TO_AUTO_EDIT_MODE;
+      subText = '';
       break;
   }
 

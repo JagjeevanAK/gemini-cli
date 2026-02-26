@@ -15,6 +15,7 @@ import { LoadingIndicator } from './LoadingIndicator.js';
 import { StatusDisplay } from './StatusDisplay.js';
 import { ToastDisplay, shouldShowToast } from './ToastDisplay.js';
 import { ApprovalModeIndicator } from './ApprovalModeIndicator.js';
+import { MicStatusDisplay } from './MicStatusDisplay.js';
 import { ShellModeIndicator } from './ShellModeIndicator.js';
 import { DetailedMessagesDisplay } from './DetailedMessagesDisplay.js';
 import { RawMarkdownIndicator } from './RawMarkdownIndicator.js';
@@ -226,6 +227,15 @@ export const Composer = ({ isFocused = true }: { isFocused?: boolean }) => {
                 elapsedTime={uiState.elapsedTime}
               />
             )}
+            {showUiDetails &&
+              showApprovalIndicator &&
+              showApprovalModeIndicator === ApprovalMode.DEFAULT && (
+                <Box marginLeft={showLoadingIndicator ? 1 : 0}>
+                  <Text color={theme.text.secondary}>
+                    shift+tab to accept edits
+                  </Text>
+                </Box>
+              )}
           </Box>
           <Box
             marginTop={isNarrow ? 1 : 0}
@@ -343,6 +353,12 @@ export const Composer = ({ isFocused = true }: { isFocused?: boolean }) => {
                   flexDirection={isNarrow ? 'column' : 'row'}
                   alignItems={isNarrow ? 'flex-start' : 'center'}
                 >
+                  <Box
+                    marginRight={showApprovalIndicator && !isNarrow ? 1 : 0}
+                    marginBottom={showApprovalIndicator && isNarrow ? 1 : 0}
+                  >
+                    <MicStatusDisplay />
+                  </Box>
                   {showApprovalIndicator && (
                     <ApprovalModeIndicator
                       approvalMode={showApprovalModeIndicator}
