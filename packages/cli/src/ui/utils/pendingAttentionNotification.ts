@@ -18,6 +18,61 @@ export interface PendingAttentionNotification {
   event: RunEventNotificationEvent;
 }
 
+function shortenForSpeech(text: string, maxChars: number) {
+  const cleaned = text.replace(/\s+/g, ' ').trim();
+  if (!cleaned) {
+    return '';
+  }
+  if (cleaned.length <= maxChars) {
+    return cleaned;
+  }
+  return `${cleaned.slice(0, maxChars - 3)}...`;
+}
+
+function buildToolPermissionDetail(
+  details: NonNullable<
+    ReturnType<typeof getConfirmingToolState>
+  >['tool']['confirmationDetails'],
+  fallbackTitle: string | undefined,
+) {
+  if (!details) {
+    return 'I need your permission to continue this task. Say "allow" or "deny".';
+  }
+
+  if (details.type === 'exec') {
+    const command = shortenForSpeech(
+      details.command || details.rootCommand,
+      90,
+    );
+    if (command) {
+      return `I need permission to run "${command}" to continue this work. Say "allow" or "deny".`;
+    }
+    return 'I need permission to run a command to continue this work. Say "allow" or "deny".';
+  }
+
+  if (details.type === 'edit') {
+    const fileName = shortenForSpeech(details.fileName, 60);
+    return fileName
+      ? `I need permission to edit ${fileName} to complete this work. Say "allow" or "deny".`
+      : 'I need permission to edit a file to complete this work. Say "allow" or "deny".';
+  }
+
+  if (details.type === 'mcp') {
+    const toolName = shortenForSpeech(details.toolDisplayName, 60);
+    const serverName = shortenForSpeech(details.serverName, 40);
+    if (toolName && serverName) {
+      return `I need permission to run ${toolName} on ${serverName} for this task. Say "allow" or "deny".`;
+    }
+  }
+
+  const title = shortenForSpeech(details.title || fallbackTitle || '', 80);
+  if (title) {
+    return `I need your permission for ${title} to continue this task. Say "allow" or "deny".`;
+  }
+
+  return 'I need your permission to continue this task. Say "allow" or "deny".';
+}
+
 function keyFromReactNode(node: ReactNode): string {
   if (typeof node === 'string' || typeof node === 'number') {
     return String(node);
@@ -57,9 +112,7 @@ export function getPendingAttentionNotification(
       event: {
         type: 'attention',
         heading: 'Approval required',
-        detail: toolTitle
-          ? `Approve tool action: ${toolTitle}`
-          : 'Approve a pending tool action to continue.',
+        detail: buildToolPermissionDetail(details, toolTitle),
       },
     };
   }
@@ -71,7 +124,8 @@ export function getPendingAttentionNotification(
       event: {
         type: 'attention',
         heading: 'Confirmation required',
-        detail: 'A command is waiting for your confirmation.',
+        detail:
+          'A command is waiting for your confirmation. Say "allow" or "deny".',
       },
     };
   }
@@ -83,7 +137,8 @@ export function getPendingAttentionNotification(
       event: {
         type: 'attention',
         heading: 'Authentication confirmation required',
-        detail: 'Authentication is waiting for your confirmation.',
+        detail:
+          'Authentication is waiting for your confirmation. Say "allow" or "deny".',
       },
     };
   }
@@ -95,7 +150,8 @@ export function getPendingAttentionNotification(
       event: {
         type: 'attention',
         heading: 'Filesystem permission required',
-        detail: 'Read-only path access is waiting for your confirmation.',
+        detail:
+          'Read-only path access is waiting for your confirmation. Say "allow" or "deny".',
       },
     };
   }
@@ -106,7 +162,8 @@ export function getPendingAttentionNotification(
       event: {
         type: 'attention',
         heading: 'Extension update confirmation required',
-        detail: 'An extension update is waiting for your confirmation.',
+        detail:
+          'An extension update is waiting for your confirmation. Say "allow" or "deny".',
       },
     };
   }
@@ -117,7 +174,8 @@ export function getPendingAttentionNotification(
       event: {
         type: 'attention',
         heading: 'Loop detection confirmation required',
-        detail: 'A loop detection prompt is waiting for your response.',
+        detail:
+          'A loop detection prompt is waiting for your response. Say "keep" or "disable".',
       },
     };
   }

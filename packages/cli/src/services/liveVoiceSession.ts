@@ -25,11 +25,10 @@ import {
 
 // Temporary hardcoded testing default for voice sessions.
 const DEFAULT_MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
+const QUOTA_FALLBACK_MODEL = 'gemini-live-2.5-flash-preview';
 const DEFAULT_INPUT_AUDIO_MIME = 'audio/pcm;rate=16000';
-const SERVER_SILENCE_DURATION_MS = Math.max(
-  500,
-  Number(process.env['GEMINI_CLI_VOICE_SERVER_SILENCE_MS'] || '1600'),
-);
+const DEFAULT_SERVER_SILENCE_DURATION_MS = 1600;
+const DEFAULT_SETUP_COMPLETE_WAIT_MS = 1500;
 
 export interface VoiceOutputAudioChunk {
   chunk: Buffer;
@@ -48,6 +47,10 @@ export type LiveVoiceEvents = {
 
 export interface StartVoiceSessionParams {
   model?: string;
+  inputTranscriptionLanguageCode?: string;
+  advancedVad?: boolean;
+  serverSilenceMs?: number;
+  setupWaitMs?: number;
   tools?: ToolListUnion;
   systemInstruction?: string;
 }
@@ -57,14 +60,29 @@ const normalizeError = (error: unknown) =>
     ? error
     : new Error(typeof error === 'string' ? error : String(error));
 
+const toClampedNumber = (
+  value: number | undefined,
+  fallback: number,
+  minValue: number,
+) => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return fallback;
+  }
+  return Math.max(minValue, Math.floor(value));
+};
+
+const isQuotaExceededError = (message: string) => {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('exhausted your daily quota') ||
+    lower.includes('resource_exhausted') ||
+    (lower.includes('quota') && lower.includes('exhaust'))
+  );
+};
+
 const resolveModel = (model?: string) => {
   if (model) {
     return model;
-  }
-
-  const envModel = process.env['GEMINI_CLI_VOICE_MODEL'];
-  if (envModel) {
-    return envModel;
   }
 
   return DEFAULT_MODEL;
@@ -81,6 +99,9 @@ export class LiveVoiceSession extends EventEmitter<LiveVoiceEvents> {
   private recvAudioChunks = 0;
   private recvAudioBytes = 0;
   private waitingForInput: boolean | null = null;
+  private sessionOpenedAtMs = 0;
+  private setupCompleteWaitMs = DEFAULT_SETUP_COMPLETE_WAIT_MS;
+  private allowAudioWithoutSetup = false;
 
   constructor(private readonly config: Config) {
     super();
@@ -107,88 +128,148 @@ export class LiveVoiceSession extends EventEmitter<LiveVoiceEvents> {
     }
 
     const ai = await createLiveGoogleGenAI(this.config);
-    const model = resolveModel(params.model);
+    const requestedModel = resolveModel(params.model);
+    const candidateModels = params.model
+      ? [requestedModel]
+      : [...new Set([requestedModel, QUOTA_FALLBACK_MODEL])];
+    const advancedVad = params.advancedVad ?? false;
+    const serverSilenceMs = toClampedNumber(
+      params.serverSilenceMs,
+      DEFAULT_SERVER_SILENCE_DURATION_MS,
+      500,
+    );
+    const setupWaitMs = toClampedNumber(
+      params.setupWaitMs,
+      DEFAULT_SETUP_COMPLETE_WAIT_MS,
+      400,
+    );
+    const inputTranscriptionLanguageCode =
+      typeof params.inputTranscriptionLanguageCode === 'string' &&
+      params.inputTranscriptionLanguageCode.trim().length > 0
+        ? params.inputTranscriptionLanguageCode.trim()
+        : undefined;
+    this.setupCompleteWaitMs = setupWaitMs;
     voiceDebugLog('session.start.request', {
-      model,
+      model: requestedModel,
+      candidateModels,
+      inputTranscriptionLanguageCode: inputTranscriptionLanguageCode || null,
+      advancedVad,
+      serverSilenceMs,
+      setupWaitMs,
       hasTools: Boolean(params.tools),
       hasSystemInstruction: Boolean(params.systemInstruction),
     });
 
-    try {
-      const session = await ai.live.connect({
-        model,
-        config: {
-          ...(params.systemInstruction
-            ? { systemInstruction: params.systemInstruction }
-            : {}),
-          responseModalities: [Modality.AUDIO],
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-          proactivity: {
-            proactiveAudio: false,
+    let lastError: Error | undefined;
+    for (let index = 0; index < candidateModels.length; index += 1) {
+      const candidateModel = candidateModels[index];
+      try {
+        const session = await ai.live.connect({
+          model: candidateModel,
+          config: {
+            ...(params.systemInstruction
+              ? { systemInstruction: params.systemInstruction }
+              : {}),
+            responseModalities: [Modality.AUDIO],
+            // Keep transcription config empty for compatibility; some Live API
+            // variants reject additional fields like languageCode.
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+            ...(advancedVad
+              ? {
+                  proactivity: {
+                    proactiveAudio: false,
+                  },
+                  realtimeInputConfig: {
+                    activityHandling:
+                      ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+                    automaticActivityDetection: {
+                      endOfSpeechSensitivity:
+                        EndSensitivity.END_SENSITIVITY_LOW,
+                      silenceDurationMs: serverSilenceMs,
+                    },
+                  },
+                }
+              : {}),
+            tools: params.tools,
           },
-          realtimeInputConfig: {
-            activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
-            automaticActivityDetection: {
-              endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
-              silenceDurationMs: SERVER_SILENCE_DURATION_MS,
+          callbacks: {
+            onopen: () => {
+              this.sessionOpenedAtMs = Date.now();
+              this.allowAudioWithoutSetup = false;
+              voiceDebugLog('session.open', { model: candidateModel });
+              this.emit('open');
+            },
+            onmessage: (message: LiveServerMessage) => {
+              this.handleServerMessage(message);
+            },
+            onerror: (error) => {
+              voiceDebugLog('session.error', {
+                message: normalizeError(error.error).message,
+              });
+              this.emit('error', normalizeError(error.error));
+            },
+            onclose: (event) => {
+              voiceDebugLog('session.close', {
+                model: this.model,
+                closing: this.closing,
+                code: event.code,
+                reason: event.reason || null,
+                wasClean: event.wasClean,
+                setupComplete: this.setupComplete,
+                sentAudioChunks: this.sentAudioChunks,
+                sentAudioBytes: this.sentAudioBytes,
+                droppedAudioChunksBeforeSetup:
+                  this.droppedAudioChunksBeforeSetup,
+                recvAudioChunks: this.recvAudioChunks,
+                recvAudioBytes: this.recvAudioBytes,
+              });
+              this.session = undefined;
+              this.sessionOpenedAtMs = 0;
+              this.allowAudioWithoutSetup = false;
+              if (!this.closing) {
+                this.emit('close');
+              }
+              this.closing = false;
             },
           },
-          tools: params.tools,
-        },
-        callbacks: {
-          onopen: () => {
-            voiceDebugLog('session.open', { model });
-            this.emit('open');
-          },
-          onmessage: (message: LiveServerMessage) => {
-            this.handleServerMessage(message);
-          },
-          onerror: (error) => {
-            voiceDebugLog('session.error', {
-              message: normalizeError(error.error).message,
-            });
-            this.emit('error', normalizeError(error.error));
-          },
-          onclose: (event) => {
-            voiceDebugLog('session.close', {
-              model: this.model,
-              closing: this.closing,
-              code: event.code,
-              reason: event.reason || null,
-              wasClean: event.wasClean,
-              setupComplete: this.setupComplete,
-              sentAudioChunks: this.sentAudioChunks,
-              sentAudioBytes: this.sentAudioBytes,
-              droppedAudioChunksBeforeSetup: this.droppedAudioChunksBeforeSetup,
-              recvAudioChunks: this.recvAudioChunks,
-              recvAudioBytes: this.recvAudioBytes,
-            });
-            this.session = undefined;
-            if (!this.closing) {
-              this.emit('close');
-            }
-            this.closing = false;
-          },
-        },
-      });
+        });
 
-      this.session = session;
-      this.model = model;
-      this.sentAudioChunks = 0;
-      this.sentAudioBytes = 0;
-      this.droppedAudioChunksBeforeSetup = 0;
-      this.recvAudioChunks = 0;
-      this.recvAudioBytes = 0;
-      this.waitingForInput = null;
-      this.setupComplete = false;
-      return model;
-    } catch (error) {
-      voiceDebugLog('session.start.failed', {
-        message: normalizeError(error).message,
-      });
-      throw normalizeError(error);
+        this.session = session;
+        this.model = candidateModel;
+        this.sentAudioChunks = 0;
+        this.sentAudioBytes = 0;
+        this.droppedAudioChunksBeforeSetup = 0;
+        this.recvAudioChunks = 0;
+        this.recvAudioBytes = 0;
+        this.waitingForInput = null;
+        this.setupComplete = false;
+        return candidateModel;
+      } catch (error) {
+        const normalizedError = normalizeError(error);
+        lastError = normalizedError;
+        const hasNextCandidate = index < candidateModels.length - 1;
+        const shouldFallback =
+          hasNextCandidate && isQuotaExceededError(normalizedError.message);
+        voiceDebugLog('session.start.connect_failed', {
+          model: candidateModel,
+          message: normalizedError.message,
+          shouldFallback,
+          nextModel: shouldFallback ? candidateModels[index + 1] : undefined,
+        });
+        if (shouldFallback) {
+          continue;
+        }
+        break;
+      }
     }
+
+    const finalError =
+      lastError || new Error('Failed to start live voice session.');
+    voiceDebugLog('session.start.failed', {
+      message: finalError.message,
+    });
+    throw finalError;
   }
 
   sendAudioChunk(
@@ -200,11 +281,23 @@ export class LiveVoiceSession extends EventEmitter<LiveVoiceEvents> {
     }
 
     if (!this.setupComplete) {
-      this.droppedAudioChunksBeforeSetup += 1;
-      if (this.droppedAudioChunksBeforeSetup === 1) {
-        voiceDebugLog('audio.send.blocked_until_setup_complete');
+      const setupTimedOut =
+        this.sessionOpenedAtMs > 0 &&
+        Date.now() - this.sessionOpenedAtMs >= this.setupCompleteWaitMs;
+      if (setupTimedOut) {
+        if (!this.allowAudioWithoutSetup) {
+          this.allowAudioWithoutSetup = true;
+          voiceDebugLog('audio.send.setup_timeout_bypass', {
+            waitMs: this.setupCompleteWaitMs,
+          });
+        }
+      } else {
+        this.droppedAudioChunksBeforeSetup += 1;
+        if (this.droppedAudioChunksBeforeSetup === 1) {
+          voiceDebugLog('audio.send.blocked_until_setup_complete');
+        }
+        return;
       }
-      return;
     }
 
     try {
@@ -323,6 +416,9 @@ export class LiveVoiceSession extends EventEmitter<LiveVoiceEvents> {
       this.session = undefined;
       this.closing = false;
       this.setupComplete = false;
+      this.sessionOpenedAtMs = 0;
+      this.setupCompleteWaitMs = DEFAULT_SETUP_COMPLETE_WAIT_MS;
+      this.allowAudioWithoutSetup = false;
       this.emit('close');
     }
   }
@@ -330,6 +426,7 @@ export class LiveVoiceSession extends EventEmitter<LiveVoiceEvents> {
   private handleServerMessage(message: LiveServerMessage) {
     if (message.setupComplete) {
       this.setupComplete = true;
+      this.allowAudioWithoutSetup = false;
       voiceDebugLog('session.setup_complete');
     }
 
