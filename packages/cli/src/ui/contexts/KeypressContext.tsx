@@ -693,8 +693,12 @@ const KeypressContext = createContext<KeypressContextValue | undefined>(
   undefined,
 );
 
+export function useOptionalKeypressContext() {
+  return useContext(KeypressContext);
+}
+
 export function useKeypressContext() {
-  const context = useContext(KeypressContext);
+  const context = useOptionalKeypressContext();
   if (!context) {
     throw new Error(
       'useKeypressContext must be used within a KeypressProvider',
