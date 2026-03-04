@@ -50,7 +50,9 @@ import {
   type GeminiUserTier,
   type UserFeedbackPayload,
   type AgentDefinition,
-  type ApprovalMode,
+  ApprovalMode,
+  type ToolConfirmationPayload,
+  ToolConfirmationOutcome,
   IdeClient,
   ideContextStore,
   getErrorMessage,
@@ -168,6 +170,18 @@ import { shouldDismissShortcutsHelpOnHotkey } from './utils/shortcutsHelp.js';
 import { useSuspend } from './hooks/useSuspend.js';
 import { useRunEventNotifications } from './hooks/useRunEventNotifications.js';
 import { isNotificationsEnabled } from '../utils/terminalNotifications.js';
+import { VoiceAssistantContextProvider } from './contexts/VoiceAssistantContext.js';
+import {
+  useVoiceAssistantController,
+  type ResolvePendingActionRequest,
+} from './hooks/useVoiceAssistantController.js';
+import {
+  buildRuntimeStatusSummary,
+  getVoicePendingActions,
+} from './utils/voiceAssistantState.js';
+import { resolveToolConfirmation } from './utils/toolConfirmationResolver.js';
+import { getPendingAttentionNotification } from './utils/pendingAttentionNotification.js';
+import { voiceDebugLog } from '../services/voiceDebugLogger.js';
 
 function isToolExecuting(pendingHistoryItems: HistoryItemWithoutId[]) {
   return pendingHistoryItems.some((item) => {
@@ -2131,6 +2145,386 @@ Logging in with Google... Restarting Gemini CLI to continue.
     [pendingHistoryItems],
   );
 
+  const [voiceAssistantEnabled, setVoiceAssistantEnabled] = useState(false);
+
+  useEffect(() => {
+    voiceDebugLog('app.voice_debug_probe', {
+      sandbox: process.env['SANDBOX'] || null,
+      cwd: process.cwd(),
+    });
+  }, []);
+
+  useEffect(() => {
+    voiceDebugLog('app.voice_enabled.changed', {
+      enabled: voiceAssistantEnabled,
+    });
+  }, [voiceAssistantEnabled]);
+
+  const toggleVoiceAssistant = useCallback(() => {
+    setVoiceAssistantEnabled((prev) => !prev);
+  }, []);
+
+  const disableVoiceAssistant = useCallback(() => {
+    setVoiceAssistantEnabled(false);
+  }, []);
+
+  const getPendingVoiceActions = useCallback(
+    () =>
+      getVoicePendingActions({
+        pendingHistoryItems,
+        commandConfirmationRequest,
+        authConsentRequest,
+        permissionConfirmationRequest,
+        hasConfirmUpdateExtensionRequests,
+        hasLoopDetectionConfirmationRequest,
+      }),
+    [
+      pendingHistoryItems,
+      commandConfirmationRequest,
+      authConsentRequest,
+      permissionConfirmationRequest,
+      hasConfirmUpdateExtensionRequests,
+      hasLoopDetectionConfirmationRequest,
+    ],
+  );
+
+  const getRuntimeVoiceStatus = useCallback(
+    () =>
+      buildRuntimeStatusSummary({
+        streamingState,
+        pendingHistoryItems,
+        commandConfirmationRequest,
+        authConsentRequest,
+        permissionConfirmationRequest,
+        hasConfirmUpdateExtensionRequests,
+        hasLoopDetectionConfirmationRequest,
+        thoughtSubject: thought?.subject || null,
+        history: historyManager.history,
+      }),
+    [
+      streamingState,
+      pendingHistoryItems,
+      commandConfirmationRequest,
+      authConsentRequest,
+      permissionConfirmationRequest,
+      hasConfirmUpdateExtensionRequests,
+      hasLoopDetectionConfirmationRequest,
+      thought,
+      historyManager.history,
+    ],
+  );
+
+  const submitVoiceHint = useCallback(
+    (hint: string) => {
+      const trimmed = hint.trim();
+      if (!trimmed) {
+        return 'Hint was empty.';
+      }
+
+      (
+        config.userHintService as {
+          addUserHint: (
+            hintText: string,
+            options?: { force?: boolean },
+          ) => void;
+        }
+      ).addUserHint(trimmed, { force: true });
+      historyManager.addItem({
+        type: 'hint',
+        text: trimmed,
+      });
+      return 'Added your update as a live hint.';
+    },
+    [config, historyManager],
+  );
+
+  const submitVoiceUserRequest = useCallback(
+    async (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed) {
+        return 'Request was empty.';
+      }
+
+      const isAgentRunning =
+        streamingState === StreamingState.Responding ||
+        isToolExecuting(pendingHistoryItems);
+
+      if (isAgentRunning) {
+        submitVoiceHint(trimmed);
+        return 'Agent is already running. I added your update as a live hint.';
+      }
+
+      await handleFinalSubmit(trimmed);
+      return 'Submitted your request to the coding agent.';
+    },
+    [streamingState, pendingHistoryItems, submitVoiceHint, handleFinalSubmit],
+  );
+
+  const resolveVoicePendingAction = useCallback(
+    async (request: ResolvePendingActionRequest) => {
+      const pendingActions = getPendingVoiceActions();
+      if (pendingActions.length === 0) {
+        return 'There are no pending approvals right now.';
+      }
+
+      const targetAction = request.actionId
+        ? pendingActions.find((action) => action.id === request.actionId)
+        : pendingActions[0];
+      if (!targetAction) {
+        return `No pending action matches "${request.actionId}".`;
+      }
+
+      const decision = request.decision.trim().toLowerCase();
+      if (!targetAction.allowedDecisions.includes(decision)) {
+        return `Invalid decision for this action. Allowed: ${targetAction.allowedDecisions.join(', ')}.`;
+      }
+
+      if (targetAction.type === 'tool') {
+        const toolCall = allToolCalls.find(
+          (tool) => tool.callId === targetAction.toolCallId,
+        );
+        if (!toolCall) {
+          return 'Could not find the pending tool confirmation.';
+        }
+
+        const details = toolCall.confirmationDetails;
+        let outcome: ToolConfirmationOutcome | null = null;
+        let payload: ToolConfirmationPayload | undefined;
+
+        if (details?.type === 'ask_user') {
+          if (decision === 'cancel') {
+            outcome = ToolConfirmationOutcome.Cancel;
+          } else {
+            outcome = ToolConfirmationOutcome.ProceedOnce;
+            payload = {
+              answers: request.answers ?? {},
+            };
+          }
+        } else if (details?.type === 'exit_plan_mode') {
+          if (decision === 'implement_auto_edit') {
+            outcome = ToolConfirmationOutcome.ProceedOnce;
+            payload = {
+              approved: true,
+              approvalMode: ApprovalMode.AUTO_EDIT,
+            };
+          } else if (decision === 'implement_manual') {
+            outcome = ToolConfirmationOutcome.ProceedOnce;
+            payload = {
+              approved: true,
+              approvalMode: ApprovalMode.DEFAULT,
+            };
+          } else if (decision === 'stay_in_plan') {
+            outcome = ToolConfirmationOutcome.ProceedOnce;
+            payload = {
+              approved: false,
+              feedback: request.feedback,
+            };
+          } else if (decision === 'cancel') {
+            outcome = ToolConfirmationOutcome.Cancel;
+          }
+        } else {
+          switch (decision) {
+            case 'allow_once':
+              outcome = ToolConfirmationOutcome.ProceedOnce;
+              break;
+            case 'allow_session':
+              outcome = ToolConfirmationOutcome.ProceedAlways;
+              break;
+            case 'allow_always':
+              outcome = ToolConfirmationOutcome.ProceedAlwaysAndSave;
+              break;
+            case 'allow_tool_session':
+              outcome = ToolConfirmationOutcome.ProceedAlwaysTool;
+              break;
+            case 'allow_server_session':
+              outcome = ToolConfirmationOutcome.ProceedAlwaysServer;
+              break;
+            case 'modify':
+              outcome = ToolConfirmationOutcome.ModifyWithEditor;
+              break;
+            case 'cancel':
+              outcome = ToolConfirmationOutcome.Cancel;
+              break;
+            default:
+              break;
+          }
+        }
+
+        if (!outcome) {
+          return `Unable to apply decision "${decision}" for this tool.`;
+        }
+
+        const result = await resolveToolConfirmation({
+          config,
+          toolCalls: allToolCalls,
+          callId: toolCall.callId,
+          outcome,
+          payload,
+        });
+        if (result !== 'resolved') {
+          return 'Could not resolve the pending tool action.';
+        }
+
+        return `Applied decision "${decision}" to the pending tool action.`;
+      }
+
+      if (targetAction.type === 'command') {
+        const confirmed = decision === 'allow';
+        commandConfirmationRequest?.onConfirm(confirmed);
+        return confirmed
+          ? 'Approved the pending command.'
+          : 'Rejected the pending command.';
+      }
+
+      if (targetAction.type === 'auth') {
+        const confirmed = decision === 'allow';
+        authConsentRequest?.onConfirm(confirmed);
+        return confirmed
+          ? 'Approved the authentication request.'
+          : 'Rejected the authentication request.';
+      }
+
+      if (targetAction.type === 'permission') {
+        permissionConfirmationRequest?.onComplete({
+          allowed: decision === 'allow',
+        });
+        return decision === 'allow'
+          ? 'Granted the filesystem permission request.'
+          : 'Denied the filesystem permission request.';
+      }
+
+      if (targetAction.type === 'extension_update') {
+        const requestHead = confirmUpdateExtensionRequests[0];
+        requestHead?.onConfirm(decision === 'allow');
+        return decision === 'allow'
+          ? 'Approved the extension update request.'
+          : 'Rejected the extension update request.';
+      }
+
+      if (targetAction.type === 'loop_detection') {
+        loopDetectionConfirmationRequest?.onComplete({
+          userSelection: decision === 'disable' ? 'disable' : 'keep',
+        });
+        return decision === 'disable'
+          ? 'Disabled loop detection for this session and continued.'
+          : 'Kept loop detection enabled.';
+      }
+
+      return 'Unsupported pending action type.';
+    },
+    [
+      getPendingVoiceActions,
+      allToolCalls,
+      config,
+      commandConfirmationRequest,
+      authConsentRequest,
+      permissionConfirmationRequest,
+      confirmUpdateExtensionRequests,
+      loopDetectionConfirmationRequest,
+    ],
+  );
+
+  const voiceAssistantController = useVoiceAssistantController({
+    config,
+    enabled: voiceAssistantEnabled,
+    onDisableRequested: disableVoiceAssistant,
+    getRuntimeStatus: getRuntimeVoiceStatus,
+    getPendingActions: getPendingVoiceActions,
+    submitUserRequest: submitVoiceUserRequest,
+    submitUserHint: submitVoiceHint,
+    resolvePendingAction: resolveVoicePendingAction,
+    cancelCurrentRun: cancelOngoingRequest,
+  });
+  const voiceConnectionState = voiceAssistantController.connectionState;
+  const speakVoiceAnnouncement = voiceAssistantController.speak;
+
+  const voiceAssistantAttentionNotification = useMemo(
+    () =>
+      getPendingAttentionNotification(
+        pendingHistoryItems,
+        commandConfirmationRequest,
+        authConsentRequest,
+        permissionConfirmationRequest,
+        hasConfirmUpdateExtensionRequests,
+        hasLoopDetectionConfirmationRequest,
+      ),
+    [
+      pendingHistoryItems,
+      commandConfirmationRequest,
+      authConsentRequest,
+      permissionConfirmationRequest,
+      hasConfirmUpdateExtensionRequests,
+      hasLoopDetectionConfirmationRequest,
+    ],
+  );
+
+  const lastVoiceAttentionKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!voiceAssistantEnabled || voiceConnectionState !== 'connected') {
+      lastVoiceAttentionKeyRef.current = null;
+      return;
+    }
+
+    if (!voiceAssistantAttentionNotification) {
+      lastVoiceAttentionKeyRef.current = null;
+      return;
+    }
+
+    if (
+      lastVoiceAttentionKeyRef.current ===
+      voiceAssistantAttentionNotification.key
+    ) {
+      return;
+    }
+
+    lastVoiceAttentionKeyRef.current = voiceAssistantAttentionNotification.key;
+    const event = voiceAssistantAttentionNotification.event;
+    const heading =
+      event.type === 'attention'
+        ? event.heading || 'Action required'
+        : 'Notice';
+    const detail = event.detail || 'Please check the terminal.';
+    speakVoiceAnnouncement(`${heading}. ${detail}`);
+  }, [
+    voiceAssistantEnabled,
+    voiceConnectionState,
+    speakVoiceAnnouncement,
+    voiceAssistantAttentionNotification,
+  ]);
+
+  const previousStreamingStateForVoiceRef = useRef(streamingState);
+  useEffect(() => {
+    const previousState = previousStreamingStateForVoiceRef.current;
+    previousStreamingStateForVoiceRef.current = streamingState;
+
+    if (!voiceAssistantEnabled || voiceConnectionState !== 'connected') {
+      return;
+    }
+
+    const justStartedTurn =
+      previousState === StreamingState.Idle &&
+      streamingState === StreamingState.Responding;
+    if (justStartedTurn) {
+      speakVoiceAnnouncement('Started working on your request.');
+      return;
+    }
+
+    const justCompletedTurn =
+      previousState === StreamingState.Responding &&
+      streamingState === StreamingState.Idle;
+    if (!justCompletedTurn || hasPendingActionRequired) {
+      return;
+    }
+
+    speakVoiceAnnouncement('Coding agent run complete.');
+  }, [
+    streamingState,
+    hasPendingActionRequired,
+    voiceAssistantEnabled,
+    voiceConnectionState,
+    speakVoiceAnnouncement,
+  ]);
+
   const [geminiMdFileCount, setGeminiMdFileCount] = useState<number>(
     config.getGeminiMdFileCount(),
   );
@@ -2600,11 +2994,27 @@ Logging in with Google... Restarting Gemini CLI to continue.
               startupWarnings: props.startupWarnings || [],
             }}
           >
-            <ToolActionsProvider config={config} toolCalls={allToolCalls}>
-              <ShellFocusContext.Provider value={isFocused}>
-                <App key={`app-${forceRerenderKey}`} />
-              </ShellFocusContext.Provider>
-            </ToolActionsProvider>
+            <VoiceAssistantContextProvider
+              value={{
+                enabled: voiceAssistantEnabled,
+                toggle: toggleVoiceAssistant,
+                disable: disableVoiceAssistant,
+                connectionState: voiceAssistantController.connectionState,
+                inputTranscript: voiceAssistantController.inputTranscript,
+                outputTranscript: voiceAssistantController.outputTranscript,
+                model: voiceAssistantController.model,
+                error: voiceAssistantController.error,
+                playbackWarning: voiceAssistantController.playbackWarning,
+                speak: voiceAssistantController.speak,
+                lastOutputAt: voiceAssistantController.lastOutputAt,
+              }}
+            >
+              <ToolActionsProvider config={config} toolCalls={allToolCalls}>
+                <ShellFocusContext.Provider value={isFocused}>
+                  <App key={`app-${forceRerenderKey}`} />
+                </ShellFocusContext.Provider>
+              </ToolActionsProvider>
+            </VoiceAssistantContextProvider>
           </AppContext.Provider>
         </ConfigContext.Provider>
       </UIActionsContext.Provider>
