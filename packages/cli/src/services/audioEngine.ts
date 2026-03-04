@@ -14,6 +14,7 @@ import mic from 'mic';
 import * as ort from 'onnxruntime-node';
 import commandExists from 'command-exists';
 import { fetch } from 'undici';
+import { voiceDebugLog } from './voiceDebugLogger.js';
 
 const SAMPLE_RATE = 16000;
 const CHANNELS = 1;
@@ -51,6 +52,7 @@ export interface AudioState {
 
 type AudioEvents = {
   data: [AudioState];
+  pcm: [Buffer];
   error: [Error];
 };
 
@@ -91,6 +93,16 @@ const toFloat32 = (buffer: Buffer) => {
     float32[i] = buffer.readInt16LE(i * 2) / 32768;
   }
   return float32;
+};
+
+const toPcm16 = (samples: Float32Array) => {
+  const buffer = Buffer.allocUnsafe(samples.length * 2);
+  for (let i = 0; i < samples.length; i += 1) {
+    const clamped = clamp(samples[i], -1, 1);
+    const pcm = clamped < 0 ? clamped * 32768 : clamped * 32767;
+    buffer.writeInt16LE(Math.round(pcm), i * 2);
+  }
+  return buffer;
 };
 
 const downsampleByFactor = (samples: Float32Array, factor: number) => {
@@ -245,7 +257,9 @@ class AudioEngine extends EventEmitter<AudioEvents> {
   private permissionRequired = false;
   private speechCandidateSince: number | null = null;
   private subscribers = 0;
+  private pcmSubscribers = 0;
   private sourceSampleRate = SAMPLE_RATE;
+  private loggedSourceRate = SAMPLE_RATE;
   private sourceRateWindowStart = 0;
   private sourceRateWindowSamples = 0;
   private frameSize = DEFAULT_FRAME_SIZE;
@@ -277,7 +291,24 @@ class AudioEngine extends EventEmitter<AudioEvents> {
     return () => {
       this.off('data', handler);
       this.subscribers = Math.max(0, this.subscribers - 1);
-      if (this.subscribers === 0) {
+      if (this.subscribers === 0 && this.pcmSubscribers === 0) {
+        this.stop();
+      }
+    };
+  }
+
+  subscribePcm(handler: (buffer: Buffer) => void) {
+    this.on('pcm', handler);
+    this.pcmSubscribers += 1;
+
+    if (this.pcmSubscribers === 1 && this.subscribers === 0) {
+      void this.ensureStarted();
+    }
+
+    return () => {
+      this.off('pcm', handler);
+      this.pcmSubscribers = Math.max(0, this.pcmSubscribers - 1);
+      if (this.subscribers === 0 && this.pcmSubscribers === 0) {
         this.stop();
       }
     };
@@ -337,6 +368,11 @@ class AudioEngine extends EventEmitter<AudioEvents> {
       }
 
       if (this.subscribers === 0) {
+        if (this.pcmSubscribers === 0) {
+          return;
+        }
+      }
+      if (this.subscribers === 0 && this.pcmSubscribers === 0) {
         return;
       }
 
@@ -384,6 +420,7 @@ class AudioEngine extends EventEmitter<AudioEvents> {
     this.isTalking = false;
     this.lastProbability = 0;
     this.sourceSampleRate = SAMPLE_RATE;
+    this.loggedSourceRate = SAMPLE_RATE;
     this.sourceRateWindowStart = 0;
     this.sourceRateWindowSamples = 0;
     this.audioChunks = [];
@@ -420,11 +457,20 @@ class AudioEngine extends EventEmitter<AudioEvents> {
     });
 
     const stream = micInstance.getAudioStream();
+    voiceDebugLog('audio.mic.start', {
+      command: MIC_COMMAND,
+      requestedRate: SAMPLE_RATE,
+      channels: CHANNELS,
+      bitWidth: BIT_WIDTH,
+    });
 
     stream.on('data', this.handleAudioChunk);
     stream.on('error', (error) => {
       const resolvedError =
         error instanceof Error ? error : new Error(String(error));
+      voiceDebugLog('audio.mic.error', {
+        message: resolvedError.message,
+      });
       this.setErrorState(resolvedError);
       this.emit('error', resolvedError);
     });
@@ -432,6 +478,7 @@ class AudioEngine extends EventEmitter<AudioEvents> {
     this.micInstance = micInstance;
     this.micStream = stream;
     micInstance.start();
+    voiceDebugLog('audio.mic.started');
     return true;
   }
 
@@ -462,6 +509,13 @@ class AudioEngine extends EventEmitter<AudioEvents> {
         const estimatedRate = this.sourceRateWindowSamples / elapsedSeconds;
         this.sourceSampleRate =
           estimatedRate > SOURCE_RATE_THRESHOLD ? 48000 : SAMPLE_RATE;
+        if (this.sourceSampleRate !== this.loggedSourceRate) {
+          this.loggedSourceRate = this.sourceSampleRate;
+          voiceDebugLog('audio.source_rate.detected', {
+            estimatedRate: Math.round(estimatedRate),
+            selectedRate: this.sourceSampleRate,
+          });
+        }
       }
       this.sourceRateWindowStart = now;
       this.sourceRateWindowSamples = 0;
@@ -472,6 +526,11 @@ class AudioEngine extends EventEmitter<AudioEvents> {
       downsampleFactor > 1
         ? downsampleByFactor(rawSamples, downsampleFactor)
         : rawSamples;
+
+    // Always publish 16kHz PCM for live voice transport. Some hosts still
+    // deliver 48kHz frames from `rec` despite requested capture rate.
+    this.emit('pcm', toPcm16(samples));
+
     const rms = computeRms(samples);
 
     this.lastRms = rms;
