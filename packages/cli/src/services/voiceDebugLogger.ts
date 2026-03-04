@@ -11,17 +11,12 @@ import path from 'node:path';
 const IS_DEV_RUNTIME = process.env['DEV'] === 'true';
 const IS_NPM_START = process.env['npm_lifecycle_event'] === 'start';
 const IS_SANDBOX_RUNTIME = process.env['SANDBOX'] === 'true';
-// Temporarily disabled for local troubleshooting while keeping code in place.
-// Re-enable by restoring the original env-driven expression below.
-const DEBUG_ENABLED = false;
-// const DEBUG_ENABLED =
-//   process.env['GEMINI_CLI_VOICE_DEBUG'] !== '0' &&
-//   (
-//     process.env['GEMINI_CLI_VOICE_DEBUG'] === '1' ||
-//     IS_DEV_RUNTIME ||
-//     IS_NPM_START ||
-//     IS_SANDBOX_RUNTIME
-//   );
+const DEBUG_ENABLED =
+  process.env['GEMINI_CLI_VOICE_DEBUG'] !== '0' &&
+  (process.env['GEMINI_CLI_VOICE_DEBUG'] === '1' ||
+    IS_DEV_RUNTIME ||
+    IS_NPM_START ||
+    IS_SANDBOX_RUNTIME);
 
 const explicitLogPath = process.env['GEMINI_CLI_VOICE_LOG_FILE']?.trim();
 const candidateLogPaths = [

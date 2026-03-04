@@ -8,7 +8,7 @@ import { execFile } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getErrorMessage, type Config } from '@google/gemini-cli-core';
 import {
   type FunctionCall,
@@ -40,9 +40,26 @@ export interface ResolvePendingActionRequest {
   approvalMode?: string;
 }
 
+export interface VoiceAssistantRuntimeConfig {
+  model?: string;
+  inputTranscriptionLanguageCode?: string;
+  forceTurnEndOnSilence?: boolean;
+  turnEndSilenceMs?: number;
+  maxSpeechSegmentMs?: number;
+  transcriptTurnFallback?: boolean;
+  transcriptTurnCooldownMs?: number;
+  localAssistantFallback?: boolean;
+  localAssistantFallbackMs?: number;
+  advancedVad?: boolean;
+  serverSilenceMs?: number;
+  setupWaitMs?: number;
+}
+
 interface VoiceAssistantControllerParams {
   config: Config | undefined;
   enabled: boolean;
+  runtimeConfig?: VoiceAssistantRuntimeConfig;
+  isAgentBusy: () => boolean;
   onDisableRequested: () => void;
   getRuntimeStatus: () => string;
   getPendingActions: () => VoicePendingAction[];
@@ -63,32 +80,30 @@ const INITIAL_STATE: VoiceAssistantControllerState = {
   playbackWarning: null,
 };
 
-const FORCE_TURN_END_ON_SILENCE =
-  process.env['GEMINI_CLI_VOICE_FORCE_TURN_END'] !== '0';
-const TURN_END_SILENCE_MS = Math.max(
-  300,
-  Number(process.env['GEMINI_CLI_VOICE_TURN_END_SILENCE_MS'] || '1600'),
-);
-const MAX_SPEECH_SEGMENT_MS = Math.max(
-  1200,
-  Number(process.env['GEMINI_CLI_VOICE_MAX_SPEECH_MS'] || '9000'),
-);
-// Temporarily disabled while isolating live-voice response behavior.
-// const TRANSCRIPT_TURN_FALLBACK =
-//   process.env['GEMINI_CLI_VOICE_TRANSCRIPT_FALLBACK'] !== '0';
-const TRANSCRIPT_TURN_FALLBACK = false;
-const TRANSCRIPT_TURN_COOLDOWN_MS = Math.max(
-  1200,
-  Number(process.env['GEMINI_CLI_VOICE_TRANSCRIPT_COOLDOWN_MS'] || '4000'),
-);
-// Temporarily disabled while isolating live-voice response behavior.
-// const LOCAL_ASSISTANT_FALLBACK_ENABLED =
-//   process.env['GEMINI_CLI_VOICE_LOCAL_FALLBACK'] !== '0';
-const LOCAL_ASSISTANT_FALLBACK_ENABLED = false;
-const LOCAL_ASSISTANT_FALLBACK_MS = Math.max(
-  1500,
-  Number(process.env['GEMINI_CLI_VOICE_LOCAL_FALLBACK_MS'] || '3200'),
-);
+const DEFAULT_FORCE_TURN_END_ON_SILENCE = true;
+const DEFAULT_INPUT_TRANSCRIPTION_LANGUAGE_CODE = 'en-US';
+const DEFAULT_TURN_END_SILENCE_MS = 1600;
+const DEFAULT_MAX_SPEECH_SEGMENT_MS = 9000;
+const DEFAULT_TRANSCRIPT_TURN_FALLBACK = false;
+const DEFAULT_TRANSCRIPT_TURN_COOLDOWN_MS = 4000;
+const DEFAULT_LOCAL_ASSISTANT_FALLBACK = false;
+const DEFAULT_LOCAL_ASSISTANT_FALLBACK_MS = 3200;
+const DEFAULT_ADVANCED_VAD = false;
+const DEFAULT_SERVER_SILENCE_MS = 1600;
+const DEFAULT_SETUP_WAIT_MS = 1500;
+const AUTO_HANDOFF_FALLBACK_MS = 1800;
+const AUTO_HANDOFF_BUSY_FALLBACK_MS = 700;
+const SILENCE_HANDOFF_FALLBACK_MS = 1200;
+const SILENCE_HANDOFF_BUSY_FALLBACK_MS = 650;
+const INPUT_UTTERANCE_WINDOW_MS = 7000;
+const OUTPUT_ECHO_WINDOW_MS = 12000;
+const POST_TOOL_MODEL_MUTE_MS = 2400;
+const REQUEST_DEDUP_WINDOW_MS = 12000;
+const LOCAL_ANNOUNCEMENT_SPEECH_RATE = '195';
+const LOCAL_ANNOUNCEMENT_TIMEOUT_MS = 20000;
+const LOCAL_ANNOUNCEMENT_MAX_CHARS = 260;
+const LOCAL_SPEECH_INPUT_GUARD_MS = 900;
+const LOCAL_SPEECH_OUTPUT_MUTE_BUFFER_MS = 800;
 const execFileAsync = promisify(execFile);
 const MAX_LOCAL_QUERY_LIST_LIMIT = 200;
 const MAX_LOCAL_QUERY_FILE_LINES = 200;
@@ -164,18 +179,175 @@ const NEGATIVE_TERMS = new Set([
   "don't",
   'do not',
 ]);
+const CONVERSATIONAL_PREFIX_TERMS = new Set([
+  'hey',
+  'hi',
+  'hello',
+  'yo',
+  'ok',
+  'okay',
+  'please',
+  'assistant',
+  'gemini',
+  'buddy',
+  'bro',
+]);
+const AFFIRMATIVE_MARKERS = [
+  'yes',
+  'yeah',
+  'yep',
+  'sure',
+  'okay',
+  'ok',
+  'go ahead',
+  'do it',
+  'run it',
+  'allow',
+  'approve',
+  'grant',
+] as const;
+const NEGATIVE_MARKERS = [
+  'no',
+  'nope',
+  'nah',
+  'stop',
+  'cancel',
+  'deny',
+  'reject',
+  "don't",
+  'do not',
+] as const;
+
+function toClampedNumber(
+  value: number | undefined,
+  fallback: number,
+  minValue: number,
+) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return fallback;
+  }
+  return Math.max(minValue, Math.floor(value));
+}
+
+function resolveVoiceAssistantRuntimeConfig(
+  config: VoiceAssistantRuntimeConfig | undefined,
+) {
+  const model =
+    typeof config?.model === 'string' && config.model.trim().length > 0
+      ? config.model.trim()
+      : undefined;
+  const inputTranscriptionLanguageCode =
+    typeof config?.inputTranscriptionLanguageCode === 'string' &&
+    config.inputTranscriptionLanguageCode.trim().length > 0
+      ? config.inputTranscriptionLanguageCode.trim()
+      : DEFAULT_INPUT_TRANSCRIPTION_LANGUAGE_CODE;
+
+  return {
+    model,
+    inputTranscriptionLanguageCode,
+    forceTurnEndOnSilence:
+      config?.forceTurnEndOnSilence ?? DEFAULT_FORCE_TURN_END_ON_SILENCE,
+    turnEndSilenceMs: toClampedNumber(
+      config?.turnEndSilenceMs,
+      DEFAULT_TURN_END_SILENCE_MS,
+      300,
+    ),
+    maxSpeechSegmentMs: toClampedNumber(
+      config?.maxSpeechSegmentMs,
+      DEFAULT_MAX_SPEECH_SEGMENT_MS,
+      1200,
+    ),
+    transcriptTurnFallback:
+      config?.transcriptTurnFallback ?? DEFAULT_TRANSCRIPT_TURN_FALLBACK,
+    transcriptTurnCooldownMs: toClampedNumber(
+      config?.transcriptTurnCooldownMs,
+      DEFAULT_TRANSCRIPT_TURN_COOLDOWN_MS,
+      1200,
+    ),
+    localAssistantFallback:
+      config?.localAssistantFallback ?? DEFAULT_LOCAL_ASSISTANT_FALLBACK,
+    localAssistantFallbackMs: toClampedNumber(
+      config?.localAssistantFallbackMs,
+      DEFAULT_LOCAL_ASSISTANT_FALLBACK_MS,
+      1500,
+    ),
+    advancedVad: config?.advancedVad ?? DEFAULT_ADVANCED_VAD,
+    serverSilenceMs: toClampedNumber(
+      config?.serverSilenceMs,
+      DEFAULT_SERVER_SILENCE_MS,
+      500,
+    ),
+    setupWaitMs: toClampedNumber(
+      config?.setupWaitMs,
+      DEFAULT_SETUP_WAIT_MS,
+      400,
+    ),
+  };
+}
+
+function sanitizeAnnouncementText(text: string) {
+  const cleaned = text
+    .replace(
+      /\[VOICE_AGENT_HANDOFF_V1\][\s\S]*?\[\/VOICE_AGENT_HANDOFF_V1\]/g,
+      '',
+    )
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/^\s*[-*]\s+/gm, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) {
+    return '';
+  }
+  if (cleaned.length <= LOCAL_ANNOUNCEMENT_MAX_CHARS) {
+    return cleaned;
+  }
+
+  const sentenceMatches = cleaned.match(/[^.!?]+[.!?]?/g) || [];
+  let sentenceSummary = '';
+  for (const sentence of sentenceMatches) {
+    const candidate = `${sentenceSummary}${sentence}`.trim();
+    if (candidate.length > LOCAL_ANNOUNCEMENT_MAX_CHARS) {
+      break;
+    }
+    sentenceSummary = candidate.endsWith(' ') ? candidate : `${candidate} `;
+  }
+
+  const sentenceResult = sentenceSummary.trim();
+  if (
+    sentenceResult.length >= Math.floor(LOCAL_ANNOUNCEMENT_MAX_CHARS * 0.55)
+  ) {
+    return sentenceResult;
+  }
+
+  const hardLimit = LOCAL_ANNOUNCEMENT_MAX_CHARS - 1;
+  let clipped = cleaned.slice(0, hardLimit).trim();
+  const lastSpace = clipped.lastIndexOf(' ');
+  if (lastSpace >= 48) {
+    clipped = clipped.slice(0, lastSpace).trim();
+  }
+  clipped = clipped.replace(/[,:;.-]+$/g, '').trim();
+  if (!clipped) {
+    return cleaned.slice(0, LOCAL_ANNOUNCEMENT_MAX_CHARS);
+  }
+  return `${clipped}.`;
+}
 
 const VOICE_ASSISTANT_SYSTEM_INSTRUCTION = `
 You are Gemini CLI Voice Assistant, a concise personal assistant controlling a coding agent.
 Hard rules:
-- Respond in plain text using one short sentence unless you need one clarification question.
+- Sound like a friendly, confident coding partner and keep replies concise.
+- Use natural conversational phrasing; avoid robotic status narration.
+- Respond in plain text using one to two short sentences unless you need one clarification question.
 - Never narrate internal reasoning, tool usage, or phrases like "initiating analysis".
 - Do not use markdown headings or status banners.
-- If the transcript sounds partial or ambiguous, ask for a full one-sentence request before submitting it.
-- For factual workspace/repo/file questions, call query_local_context first and answer directly.
-- Only delegate with submit_user_request when the user clearly asks the coding agent to do work.
-- Use submit_user_request only for clear, complete requests intended for the coding agent.
+- Do not dump long raw file-path lists; summarize counts and mention at most two examples.
+- If the transcript sounds partial, wait for additional speech instead of immediately asking for restatement.
+- Never invent workspace facts, file names, git counts, paths, or command outputs.
+- Default to submit_user_request for user work requests so the coding agent does the real execution.
+- Use query_local_context only for lightweight read-only checks when delegation is unnecessary.
 - For status, approvals, permissions, or control, use tools instead of guessing.
+- For git status, changed files, or uncommitted file questions, delegate via submit_user_request.
 - Never auto-approve actions without an explicit user decision.
 - If the user says "stop" ambiguously, ask whether they mean stop listening, stop the active run, or both.
 - For mid-run changes while the agent is working, submit a steering hint so work continues.
@@ -379,11 +551,11 @@ function isLikelyFragment(text: string): boolean {
   }
 
   if (FRAGMENT_LEADS.has(first)) {
-    return true;
+    return words.length <= 4;
   }
 
-  // Short utterances without clear question/command lead are often partial.
-  return words.length <= 4;
+  // Very short utterances without clear question/command lead are often partial.
+  return words.length <= 2;
 }
 
 function normalizeTranscriptText(text: string): string {
@@ -392,6 +564,218 @@ function normalizeTranscriptText(text: string): string {
     .replace(/[^a-z0-9\s']/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function containsAnyKeyword(text: string, keywords: readonly string[]) {
+  return keywords.some((keyword) => text.includes(keyword));
+}
+
+function tokenizeForEcho(text: string): string[] {
+  return normalizeTranscriptText(text)
+    .split(/\s+/)
+    .filter((token) => token.length >= 2 && !/^\d+$/.test(token));
+}
+
+function hasStrongTokenOverlap(inputText: string, outputText: string): boolean {
+  const inputTokens = Array.from(new Set(tokenizeForEcho(inputText)));
+  const outputTokens = new Set(tokenizeForEcho(outputText));
+
+  if (inputTokens.length < 2 || outputTokens.size < 2) {
+    return false;
+  }
+
+  let sharedCount = 0;
+  for (const token of inputTokens) {
+    if (outputTokens.has(token)) {
+      sharedCount += 1;
+    }
+  }
+
+  if (sharedCount < 2) {
+    return false;
+  }
+
+  const inputCoverage = sharedCount / inputTokens.length;
+  const outputCoverage = sharedCount / outputTokens.size;
+  return (
+    inputCoverage >= 0.72 || (inputCoverage >= 0.55 && outputCoverage >= 0.35)
+  );
+}
+
+interface TimedTranscriptSegment {
+  at: number;
+  text: string;
+}
+
+function pruneTranscriptSegments(
+  segments: TimedTranscriptSegment[],
+  now: number,
+  maxAgeMs: number,
+) {
+  return segments.filter((segment) => now - segment.at <= maxAgeMs);
+}
+
+function buildCandidateUtterance(
+  segments: TimedTranscriptSegment[],
+  maxAgeMs: number,
+  now: number,
+) {
+  const fresh = pruneTranscriptSegments(segments, now, maxAgeMs);
+  if (fresh.length === 0) {
+    return '';
+  }
+
+  let combined = '';
+  for (const segment of fresh) {
+    const raw = segment.text;
+    if (!raw.trim()) {
+      continue;
+    }
+    if (!combined) {
+      combined = raw;
+      continue;
+    }
+
+    const merged = mergeTranscriptChunk(combined, raw);
+    combined = merged;
+  }
+
+  return combined.replace(/\s+/g, ' ').trim();
+}
+
+function mergeTranscriptChunk(base: string, chunk: string): string {
+  if (!base) {
+    return chunk;
+  }
+
+  const normalizedBase = base.toLowerCase();
+  const normalizedChunk = chunk.toLowerCase();
+  const maxOverlap = Math.min(
+    normalizedBase.length,
+    normalizedChunk.length,
+    48,
+  );
+
+  for (let overlap = maxOverlap; overlap >= 1; overlap--) {
+    if (
+      normalizedBase.slice(normalizedBase.length - overlap) ===
+      normalizedChunk.slice(0, overlap)
+    ) {
+      return base + chunk.slice(overlap);
+    }
+  }
+
+  if (/\s$/.test(base) || /^\s/.test(chunk)) {
+    return base + chunk;
+  }
+
+  if (/^[A-Z]/.test(chunk)) {
+    return `${base} ${chunk}`;
+  }
+
+  return base + chunk;
+}
+
+function stripConversationalPrefix(text: string): string {
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.length === 0) {
+    return '';
+  }
+
+  let removed = 0;
+  while (words.length > 0 && removed < 3) {
+    if (!CONVERSATIONAL_PREFIX_TERMS.has(words[0])) {
+      break;
+    }
+    words.shift();
+    removed += 1;
+  }
+  return words.join(' ');
+}
+
+function isLikelyAssistantEcho(
+  inputText: string,
+  outputSegments: TimedTranscriptSegment[],
+  now: number,
+) {
+  const input = normalizeTranscriptText(inputText);
+  if (input.length < 4) {
+    return false;
+  }
+
+  const freshOutputs = pruneTranscriptSegments(
+    outputSegments,
+    now,
+    OUTPUT_ECHO_WINDOW_MS,
+  );
+  for (const output of freshOutputs) {
+    const normalizedOutput = normalizeTranscriptText(output.text);
+    if (!normalizedOutput) {
+      continue;
+    }
+    if (
+      normalizedOutput === input ||
+      normalizedOutput.includes(input) ||
+      input.includes(normalizedOutput)
+    ) {
+      return true;
+    }
+    if (hasStrongTokenOverlap(input, normalizedOutput)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isLikelyMetaNarration(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return false;
+  }
+  if (trimmed.startsWith('**')) {
+    return true;
+  }
+
+  const normalized = normalizeTranscriptText(trimmed);
+  return containsAnyKeyword(normalized, [
+    'awaiting tool results',
+    'holding pattern',
+    'my next move',
+    'i m currently',
+    'i am currently',
+    'i m focusing',
+    'i am focusing',
+    'clarifying ambiguity',
+    'assessing local context',
+    'submitting user request',
+    'delegating',
+    'i cannot directly',
+    'submit a request to the coding agent',
+    'call in the coding agent',
+    'query local context',
+    'tool explicitly rejected',
+  ]);
+}
+
+function isGitDelegationIntent(query: string, fallbackText: string) {
+  if (query === 'git_status' || query === 'git_changed_files') {
+    return true;
+  }
+  const normalized = normalizeTranscriptText(fallbackText);
+  if (!normalized) {
+    return false;
+  }
+  return containsAnyKeyword(normalized, [
+    'uncommitted',
+    'changed file',
+    'changed files',
+    'git status',
+    'staged',
+    'unstaged',
+    'untracked',
+    'working tree',
+  ]);
 }
 
 function detectSimpleDecision(text: string): 'approve' | 'reject' | null {
@@ -406,7 +790,86 @@ function detectSimpleDecision(text: string): 'approve' | 'reject' | null {
   if (NEGATIVE_TERMS.has(normalized)) {
     return 'reject';
   }
+
+  const hasAffirmative = AFFIRMATIVE_MARKERS.some((marker) =>
+    normalized.includes(marker),
+  );
+  const hasNegative = NEGATIVE_MARKERS.some((marker) =>
+    normalized.includes(marker),
+  );
+  if (hasAffirmative && !hasNegative) {
+    return 'approve';
+  }
+  if (hasNegative && !hasAffirmative) {
+    return 'reject';
+  }
   return null;
+}
+
+function shouldAutoHandoffToCodingAgent(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  if (detectSimpleDecision(trimmed)) {
+    return false;
+  }
+
+  if (isLikelyFragment(trimmed)) {
+    return false;
+  }
+
+  const normalized = stripConversationalPrefix(
+    normalizeTranscriptText(trimmed),
+  );
+  if (!normalized) {
+    return false;
+  }
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (words.length < 3) {
+    if (
+      normalized.includes('help me') ||
+      normalized.includes('find files') ||
+      normalized.includes('find file')
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  const first = words[0];
+  const last = words[words.length - 1];
+  const ambiguousTailTokens = new Set([
+    'me',
+    'you',
+    'us',
+    'it',
+    'this',
+    'that',
+    'please',
+    'now',
+  ]);
+  if (ambiguousTailTokens.has(last)) {
+    return false;
+  }
+
+  if (first === 'can' || first === 'could' || first === 'would') {
+    if (words.length < 5) {
+      return false;
+    }
+    return normalized.startsWith('can you ');
+  }
+
+  if (first === 'please') {
+    return words.length >= 4;
+  }
+
+  if (QUESTION_LEADS.has(first) || COMMAND_LEADS.has(first)) {
+    return true;
+  }
+
+  return false;
 }
 
 function pickDecisionForIntent(
@@ -726,6 +1189,8 @@ async function runLocalContextQuery(args: Record<string, unknown>) {
 export function useVoiceAssistantController({
   config,
   enabled,
+  runtimeConfig,
+  isAgentBusy,
   onDisableRequested,
   getRuntimeStatus,
   getPendingActions,
@@ -734,31 +1199,144 @@ export function useVoiceAssistantController({
   resolvePendingAction,
   cancelCurrentRun,
 }: VoiceAssistantControllerParams) {
+  const resolvedRuntimeConfig = useMemo(
+    () => resolveVoiceAssistantRuntimeConfig(runtimeConfig),
+    [runtimeConfig],
+  );
   const [state, setState] =
     useState<VoiceAssistantControllerState>(INITIAL_STATE);
   const sessionRef = useRef<LiveVoiceSession | null>(null);
   const playbackRef = useRef<AudioPlayback | null>(null);
+  const getRuntimeStatusRef = useRef(getRuntimeStatus);
+  const getPendingActionsRef = useRef(getPendingActions);
+  const isAgentBusyRef = useRef(isAgentBusy);
+  const submitUserRequestRef = useRef(submitUserRequest);
+  const submitUserHintRef = useRef(submitUserHint);
+  const resolvePendingActionRef = useRef(resolvePendingAction);
+  const cancelCurrentRunRef = useRef(cancelCurrentRun);
+  const onDisableRequestedRef = useRef(onDisableRequested);
   const wasTalkingRef = useRef(false);
   const speechStartAtRef = useRef(0);
   const lastTalkingAtRef = useRef(0);
   const lastTurnEndSignalAtRef = useRef(0);
+  const lastInputAtRef = useRef(0);
   const latestInputTranscriptRef = useRef('');
   const lastOutputAtRef = useRef(0);
   const lastToolCallAtRef = useRef(0);
   const lastTranscriptFallbackAtRef = useRef(0);
   const lastLocalFallbackTranscriptRef = useRef('');
   const lastDirectDecisionKeyRef = useRef('');
+  const lastAutoHandoffTranscriptRef = useRef('');
+  const lastUserUtteranceRef = useRef('');
+  const lastSubmittedRequestNormalizedRef = useRef('');
+  const lastSubmittedRequestAtRef = useRef(0);
+  const recentInputSegmentsRef = useRef<TimedTranscriptSegment[]>([]);
+  const recentOutputSegmentsRef = useRef<TimedTranscriptSegment[]>([]);
+  const muteModelOutputUntilRef = useRef(0);
   const localFallbackTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const autoHandoffTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const silenceHandoffTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const localSpeechQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const localSpeechActiveRef = useRef(false);
+  const localSpeechInputGuardUntilRef = useRef(0);
   const [lastOutputAt, setLastOutputAt] = useState<number>(0);
 
+  useEffect(() => {
+    getRuntimeStatusRef.current = getRuntimeStatus;
+    getPendingActionsRef.current = getPendingActions;
+    isAgentBusyRef.current = isAgentBusy;
+    submitUserRequestRef.current = submitUserRequest;
+    submitUserHintRef.current = submitUserHint;
+    resolvePendingActionRef.current = resolvePendingAction;
+    cancelCurrentRunRef.current = cancelCurrentRun;
+    onDisableRequestedRef.current = onDisableRequested;
+  }, [
+    getRuntimeStatus,
+    getPendingActions,
+    isAgentBusy,
+    submitUserRequest,
+    submitUserHint,
+    resolvePendingAction,
+    cancelCurrentRun,
+    onDisableRequested,
+  ]);
+
   const speak = useCallback((text: string) => {
-    const prompt = text.trim();
-    if (!prompt || !sessionRef.current?.isConnected()) {
+    const prompt = sanitizeAnnouncementText(text);
+    if (!prompt) {
       return false;
     }
-    sessionRef.current.sendTextTurn(
-      `Notification: ${prompt}\nReply in one short sentence.`,
+
+    const now = Date.now();
+    recentOutputSegmentsRef.current = pruneTranscriptSegments(
+      recentOutputSegmentsRef.current,
+      now,
+      OUTPUT_ECHO_WINDOW_MS,
     );
+    recentOutputSegmentsRef.current.push({
+      at: now,
+      text: prompt,
+    });
+
+    const speakViaModel = () => {
+      if (!sessionRef.current?.isConnected()) {
+        return false;
+      }
+      muteModelOutputUntilRef.current = 0;
+      sessionRef.current.sendTextTurn(
+        `Notification: ${prompt}\nReply in one short sentence.`,
+      );
+      return true;
+    };
+
+    if (process.platform !== 'darwin') {
+      return speakViaModel();
+    }
+
+    localSpeechQueueRef.current = localSpeechQueueRef.current.then(async () => {
+      localSpeechActiveRef.current = true;
+      muteModelOutputUntilRef.current =
+        Date.now() +
+        LOCAL_ANNOUNCEMENT_TIMEOUT_MS +
+        LOCAL_SPEECH_OUTPUT_MUTE_BUFFER_MS;
+      try {
+        playbackRef.current?.stop();
+        const playbackStartResult = await playbackRef.current?.start();
+        if (playbackStartResult && !playbackStartResult.available) {
+          voiceDebugLog('announcement.local_speech.playback_unavailable', {
+            message: playbackStartResult.message || null,
+          });
+        }
+        voiceDebugLog('announcement.local_speech.start', {
+          text: prompt,
+        });
+        await execFileAsync(
+          'say',
+          ['-r', LOCAL_ANNOUNCEMENT_SPEECH_RATE, prompt],
+          {
+            timeout: LOCAL_ANNOUNCEMENT_TIMEOUT_MS,
+            maxBuffer: 1024 * 1024,
+          },
+        );
+        voiceDebugLog('announcement.local_speech.done', {
+          text: prompt,
+        });
+      } catch (error) {
+        voiceDebugLog('announcement.local_speech.failed', {
+          message: getErrorMessage(error),
+        });
+        speakViaModel();
+      } finally {
+        localSpeechActiveRef.current = false;
+        muteModelOutputUntilRef.current = Math.max(
+          muteModelOutputUntilRef.current,
+          Date.now() + LOCAL_SPEECH_OUTPUT_MUTE_BUFFER_MS,
+        );
+        localSpeechInputGuardUntilRef.current =
+          Date.now() + LOCAL_SPEECH_INPUT_GUARD_MS;
+      }
+    });
+
     return true;
   }, []);
 
@@ -769,6 +1347,16 @@ export function useVoiceAssistantController({
       sessionRef.current = null;
       playbackRef.current?.stop();
       playbackRef.current = null;
+      if (autoHandoffTimerRef.current) {
+        clearTimeout(autoHandoffTimerRef.current);
+        autoHandoffTimerRef.current = null;
+      }
+      if (silenceHandoffTimerRef.current) {
+        clearTimeout(silenceHandoffTimerRef.current);
+        silenceHandoffTimerRef.current = null;
+      }
+      localSpeechActiveRef.current = false;
+      localSpeechInputGuardUntilRef.current = 0;
       setState(INITIAL_STATE);
       return;
     }
@@ -783,16 +1371,34 @@ export function useVoiceAssistantController({
     speechStartAtRef.current = 0;
     lastTalkingAtRef.current = 0;
     lastTurnEndSignalAtRef.current = 0;
+    lastInputAtRef.current = 0;
     latestInputTranscriptRef.current = '';
     lastOutputAtRef.current = 0;
     lastToolCallAtRef.current = 0;
     lastTranscriptFallbackAtRef.current = 0;
     lastLocalFallbackTranscriptRef.current = '';
     lastDirectDecisionKeyRef.current = '';
+    lastAutoHandoffTranscriptRef.current = '';
+    lastUserUtteranceRef.current = '';
+    lastSubmittedRequestNormalizedRef.current = '';
+    lastSubmittedRequestAtRef.current = 0;
+    recentInputSegmentsRef.current = [];
+    recentOutputSegmentsRef.current = [];
+    muteModelOutputUntilRef.current = 0;
     if (localFallbackTimerRef.current) {
       clearTimeout(localFallbackTimerRef.current);
       localFallbackTimerRef.current = null;
     }
+    if (autoHandoffTimerRef.current) {
+      clearTimeout(autoHandoffTimerRef.current);
+      autoHandoffTimerRef.current = null;
+    }
+    if (silenceHandoffTimerRef.current) {
+      clearTimeout(silenceHandoffTimerRef.current);
+      silenceHandoffTimerRef.current = null;
+    }
+    localSpeechActiveRef.current = false;
+    localSpeechInputGuardUntilRef.current = 0;
 
     setState((prev) => ({
       ...prev,
@@ -814,21 +1420,99 @@ export function useVoiceAssistantController({
       }));
     };
 
+    const normalizeUserRequestForDedupe = (text: string) =>
+      stripConversationalPrefix(normalizeTranscriptText(text));
+
+    const wasRecentlySubmitted = (text: string) => {
+      const normalized = normalizeUserRequestForDedupe(text);
+      if (!normalized) {
+        return false;
+      }
+      const now = Date.now();
+      return (
+        normalized === lastSubmittedRequestNormalizedRef.current &&
+        now - lastSubmittedRequestAtRef.current < REQUEST_DEDUP_WINDOW_MS
+      );
+    };
+
+    const markSubmittedRequest = (text: string) => {
+      const normalized = normalizeUserRequestForDedupe(text);
+      if (!normalized) {
+        return;
+      }
+      lastSubmittedRequestNormalizedRef.current = normalized;
+      lastSubmittedRequestAtRef.current = Date.now();
+      lastAutoHandoffTranscriptRef.current = text.trim();
+    };
+
     const onInputTranscript = (text: string) => {
       if (!active || !text.trim()) {
         return;
       }
-      latestInputTranscriptRef.current = text.trim();
+      const now = Date.now();
+      const trimmed = text.trim();
+      if (
+        localSpeechActiveRef.current ||
+        now < localSpeechInputGuardUntilRef.current
+      ) {
+        voiceDebugLog('input.blocked.local_announcement', {
+          text: trimmed,
+          localSpeechActive: localSpeechActiveRef.current,
+          guardMsRemaining: Math.max(
+            0,
+            localSpeechInputGuardUntilRef.current - now,
+          ),
+        });
+        return;
+      }
+      lastInputAtRef.current = now;
+
+      recentOutputSegmentsRef.current = pruneTranscriptSegments(
+        recentOutputSegmentsRef.current,
+        now,
+        OUTPUT_ECHO_WINDOW_MS,
+      );
+      if (
+        isLikelyAssistantEcho(trimmed, recentOutputSegmentsRef.current, now)
+      ) {
+        voiceDebugLog('input.echo_ignored', {
+          text: trimmed,
+        });
+        return;
+      }
+
+      recentInputSegmentsRef.current = pruneTranscriptSegments(
+        recentInputSegmentsRef.current,
+        now,
+        INPUT_UTTERANCE_WINDOW_MS,
+      );
+      recentInputSegmentsRef.current.push({
+        at: now,
+        text,
+      });
+      const candidateUtterance = buildCandidateUtterance(
+        recentInputSegmentsRef.current,
+        INPUT_UTTERANCE_WINDOW_MS,
+        now,
+      );
+      latestInputTranscriptRef.current = candidateUtterance || trimmed;
+      if (
+        latestInputTranscriptRef.current.length >= 8 &&
+        !isLikelyFragment(latestInputTranscriptRef.current)
+      ) {
+        lastUserUtteranceRef.current = latestInputTranscriptRef.current;
+      }
+
       setState((prev) => ({
         ...prev,
-        inputTranscript: text,
+        inputTranscript: latestInputTranscriptRef.current,
       }));
 
       const decisionIntent = detectSimpleDecision(
         latestInputTranscriptRef.current,
       );
       if (decisionIntent) {
-        const pendingActions = getPendingActions();
+        const pendingActions = getPendingActionsRef.current();
         if (pendingActions.length > 0) {
           const pending = pendingActions[0];
           const mappedDecision = pickDecisionForIntent(
@@ -841,10 +1525,11 @@ export function useVoiceAssistantController({
             )}`;
             if (lastDirectDecisionKeyRef.current !== dedupeKey) {
               lastDirectDecisionKeyRef.current = dedupeKey;
-              void resolvePendingAction({
-                actionId: pending.id,
-                decision: mappedDecision,
-              })
+              void resolvePendingActionRef
+                .current({
+                  actionId: pending.id,
+                  decision: mappedDecision,
+                })
                 .then((message) => {
                   if (!active) {
                     return;
@@ -856,6 +1541,7 @@ export function useVoiceAssistantController({
                     ...prev,
                     outputTranscript: message,
                   }));
+                  speak(message);
                 })
                 .catch((error) => {
                   voiceDebugLog('controller.direct_decision.failed', {
@@ -868,7 +1554,69 @@ export function useVoiceAssistantController({
         }
       }
 
-      if (!LOCAL_ASSISTANT_FALLBACK_ENABLED) {
+      if (autoHandoffTimerRef.current) {
+        clearTimeout(autoHandoffTimerRef.current);
+      }
+      const isAgentBusyNow = isAgentBusyRef.current();
+      const autoHandoffDelayMs = isAgentBusyNow
+        ? AUTO_HANDOFF_BUSY_FALLBACK_MS
+        : AUTO_HANDOFF_FALLBACK_MS;
+      autoHandoffTimerRef.current = setTimeout(() => {
+        if (!active) {
+          return;
+        }
+
+        const transcript = latestInputTranscriptRef.current.trim();
+        if (!shouldAutoHandoffToCodingAgent(transcript)) {
+          return;
+        }
+        if (transcript === lastAutoHandoffTranscriptRef.current) {
+          return;
+        }
+
+        const sinceLastToolCall = Date.now() - lastToolCallAtRef.current;
+        const minToolCooldownMs = isAgentBusyRef.current()
+          ? Math.floor(AUTO_HANDOFF_BUSY_FALLBACK_MS * 0.8)
+          : AUTO_HANDOFF_FALLBACK_MS;
+        if (sinceLastToolCall < minToolCooldownMs) {
+          return;
+        }
+        if (wasRecentlySubmitted(transcript)) {
+          return;
+        }
+
+        lastAutoHandoffTranscriptRef.current = transcript;
+        lastToolCallAtRef.current = Date.now();
+        voiceDebugLog('auto_handoff.submit_request', {
+          transcript,
+        });
+
+        void submitUserRequestRef
+          .current(transcript)
+          .then((result) => {
+            if (!active) {
+              return;
+            }
+            markSubmittedRequest(transcript);
+            const message =
+              (typeof result === 'string' && result.trim()) ||
+              'Submitted your request to the coding agent.';
+            const at = Date.now();
+            setLastOutputAt(at);
+            lastOutputAtRef.current = at;
+            setState((prev) => ({
+              ...prev,
+              outputTranscript: message,
+            }));
+          })
+          .catch((error) => {
+            voiceDebugLog('auto_handoff.submit_request.failed', {
+              message: getErrorMessage(error),
+            });
+          });
+      }, autoHandoffDelayMs);
+
+      if (!resolvedRuntimeConfig.localAssistantFallback) {
         return;
       }
 
@@ -888,12 +1636,17 @@ export function useVoiceAssistantController({
         if (transcript === lastLocalFallbackTranscriptRef.current) {
           return;
         }
+        if (wasRecentlySubmitted(transcript)) {
+          return;
+        }
 
         const now = Date.now();
         const recentModelOutput =
-          now - lastOutputAtRef.current < LOCAL_ASSISTANT_FALLBACK_MS / 2;
+          now - lastOutputAtRef.current <
+          resolvedRuntimeConfig.localAssistantFallbackMs / 2;
         const recentToolCall =
-          now - lastToolCallAtRef.current < LOCAL_ASSISTANT_FALLBACK_MS / 2;
+          now - lastToolCallAtRef.current <
+          resolvedRuntimeConfig.localAssistantFallbackMs / 2;
         if (recentModelOutput || recentToolCall) {
           return;
         }
@@ -902,11 +1655,13 @@ export function useVoiceAssistantController({
         voiceDebugLog('local_fallback.submit_request', {
           transcript,
         });
-        void submitUserRequest(transcript)
+        void submitUserRequestRef
+          .current(transcript)
           .then((result) => {
             if (!active) {
               return;
             }
+            markSubmittedRequest(transcript);
             const message =
               (typeof result === 'string' && result.trim()) ||
               'Submitted your request.';
@@ -923,15 +1678,50 @@ export function useVoiceAssistantController({
               message: getErrorMessage(error),
             });
           });
-      }, LOCAL_ASSISTANT_FALLBACK_MS);
+      }, resolvedRuntimeConfig.localAssistantFallbackMs);
     };
 
     const onOutputTranscript = (text: string) => {
       if (!active || !text.trim()) {
         return;
       }
-      setLastOutputAt(Date.now());
-      lastOutputAtRef.current = Date.now();
+      const now = Date.now();
+      if (now < muteModelOutputUntilRef.current) {
+        return;
+      }
+
+      const prunedOutputs = pruneTranscriptSegments(
+        recentOutputSegmentsRef.current,
+        now,
+        OUTPUT_ECHO_WINDOW_MS,
+      );
+      const candidateOutputs = [
+        ...prunedOutputs,
+        {
+          at: now,
+          text,
+        },
+      ];
+      const candidateOutput = buildCandidateUtterance(
+        candidateOutputs,
+        OUTPUT_ECHO_WINDOW_MS,
+        now,
+      );
+
+      if (
+        isLikelyMetaNarration(text) ||
+        isLikelyMetaNarration(candidateOutput)
+      ) {
+        muteModelOutputUntilRef.current = now + POST_TOOL_MODEL_MUTE_MS;
+        recentOutputSegmentsRef.current = prunedOutputs;
+        voiceDebugLog('output.meta_suppressed', {
+          text: candidateOutput || text,
+        });
+        return;
+      }
+      recentOutputSegmentsRef.current = candidateOutputs;
+      setLastOutputAt(now);
+      lastOutputAtRef.current = now;
       setState((prev) => ({
         ...prev,
         outputTranscript: text,
@@ -945,6 +1735,9 @@ export function useVoiceAssistantController({
       mimeType: string;
     }) => {
       if (!active) {
+        return;
+      }
+      if (Date.now() < muteModelOutputUntilRef.current) {
         return;
       }
       playback.playChunk(chunk);
@@ -968,23 +1761,100 @@ export function useVoiceAssistantController({
       lastToolCallAtRef.current = Date.now();
       void (async () => {
         const responses: FunctionResponse[] = [];
+        let muteModelFollowup = false;
         voiceDebugLog('controller.tool_call.received', {
           count: functionCalls.length,
           names: functionCalls.map((call) => call.name || 'unknown'),
         });
         for (const call of functionCalls) {
-          responses.push(
-            await handleAssistantToolCall({
-              call,
-              getRuntimeStatus,
-              getPendingActions,
-              submitUserRequest,
-              submitUserHint,
-              resolvePendingAction,
-              cancelCurrentRun,
-              onDisableRequested,
-            }),
-          );
+          if (call.name === 'submit_user_request') {
+            const submitArgs = asObject(call.args);
+            const argText = asStringArg(submitArgs['text']);
+            const now = Date.now();
+            const fallbackCandidate = buildCandidateUtterance(
+              recentInputSegmentsRef.current,
+              INPUT_UTTERANCE_WINDOW_MS,
+              now,
+            );
+            const fallbackText =
+              fallbackCandidate.trim() ||
+              lastUserUtteranceRef.current.trim() ||
+              latestInputTranscriptRef.current.trim();
+            const intendedText = argText || fallbackText;
+            if (intendedText && wasRecentlySubmitted(intendedText)) {
+              responses.push({
+                id: call.id,
+                name: call.name || 'submit_user_request',
+                response: {
+                  ok: true,
+                  deduped: true,
+                  submittedText: intendedText,
+                  message:
+                    'I already submitted that request to the coding agent.',
+                },
+              });
+              muteModelFollowup = true;
+              continue;
+            }
+          }
+
+          const response = await handleAssistantToolCall({
+            call,
+            getRuntimeStatus: () => getRuntimeStatusRef.current(),
+            getPendingActions: () => getPendingActionsRef.current(),
+            submitUserRequest: (text) => submitUserRequestRef.current(text),
+            submitUserHint: (text) => submitUserHintRef.current(text),
+            resolvePendingAction: (request) =>
+              resolvePendingActionRef.current(request),
+            cancelCurrentRun: () => cancelCurrentRunRef.current(),
+            onDisableRequested: () => onDisableRequestedRef.current(),
+            getFallbackUserRequestText: () => {
+              const now = Date.now();
+              const candidate = buildCandidateUtterance(
+                recentInputSegmentsRef.current,
+                INPUT_UTTERANCE_WINDOW_MS,
+                now,
+              );
+              return (
+                candidate.trim() ||
+                lastUserUtteranceRef.current.trim() ||
+                latestInputTranscriptRef.current.trim()
+              );
+            },
+          });
+          responses.push(response);
+
+          const responseBody = asObject(response.response);
+          const responseMessage = asStringArg(responseBody['message']);
+          if (
+            responseMessage &&
+            (response.name === 'submit_user_request' ||
+              response.name === 'submit_user_hint' ||
+              response.name === 'resolve_pending_action' ||
+              (response.name === 'query_local_context' &&
+                responseBody['delegated'] === true))
+          ) {
+            muteModelFollowup = true;
+            const submittedText = asStringArg(responseBody['submittedText']);
+            if (
+              (response.name === 'submit_user_request' ||
+                response.name === 'query_local_context') &&
+              submittedText
+            ) {
+              markSubmittedRequest(submittedText);
+            }
+            const at = Date.now();
+            setLastOutputAt(at);
+            lastOutputAtRef.current = at;
+            setState((prev) => ({
+              ...prev,
+              outputTranscript: responseMessage,
+            }));
+          }
+        }
+        if (muteModelFollowup) {
+          muteModelOutputUntilRef.current =
+            Date.now() + POST_TOOL_MODEL_MUTE_MS;
         }
         if (responses.length > 0) {
           session.sendToolResponses(responses);
@@ -1007,13 +1877,20 @@ export function useVoiceAssistantController({
     session.on('error', onError);
 
     const unsubscribePcm = audioEngine.subscribePcm((pcmBytes) => {
+      const now = Date.now();
+      if (
+        localSpeechActiveRef.current ||
+        now < localSpeechInputGuardUntilRef.current
+      ) {
+        return;
+      }
       session.sendAudioChunk(pcmBytes);
     });
 
     const maybeSendTranscriptFallback = (
       trigger: 'silence_commit' | 'max_speech_commit',
     ) => {
-      if (!TRANSCRIPT_TURN_FALLBACK) {
+      if (!resolvedRuntimeConfig.transcriptTurnFallback) {
         return;
       }
       const transcript = latestInputTranscriptRef.current.trim();
@@ -1022,7 +1899,7 @@ export function useVoiceAssistantController({
       }
       const now = Date.now();
       const sinceLastFallback = now - lastTranscriptFallbackAtRef.current;
-      if (sinceLastFallback < TRANSCRIPT_TURN_COOLDOWN_MS) {
+      if (sinceLastFallback < resolvedRuntimeConfig.transcriptTurnCooldownMs) {
         return;
       }
 
@@ -1035,7 +1912,7 @@ export function useVoiceAssistantController({
     };
 
     const unsubscribeAudioState = audioEngine.subscribe((audioState) => {
-      if (!FORCE_TURN_END_ON_SILENCE) {
+      if (!resolvedRuntimeConfig.forceTurnEndOnSilence) {
         return;
       }
 
@@ -1044,18 +1921,26 @@ export function useVoiceAssistantController({
         if (!wasTalkingRef.current) {
           voiceDebugLog('turn.speech_start');
           speechStartAtRef.current = now;
+          recentInputSegmentsRef.current = [];
+          if (silenceHandoffTimerRef.current) {
+            clearTimeout(silenceHandoffTimerRef.current);
+            silenceHandoffTimerRef.current = null;
+          }
         }
         wasTalkingRef.current = true;
         lastTalkingAtRef.current = now;
 
         const speechMs = now - speechStartAtRef.current;
         const sinceLastSignalMs = now - lastTurnEndSignalAtRef.current;
-        if (speechMs >= MAX_SPEECH_SEGMENT_MS && sinceLastSignalMs >= 1000) {
+        if (
+          speechMs >= resolvedRuntimeConfig.maxSpeechSegmentMs &&
+          sinceLastSignalMs >= 1000
+        ) {
           lastTurnEndSignalAtRef.current = now;
           speechStartAtRef.current = now;
           voiceDebugLog('turn.max_speech_commit', {
             speechMs,
-            thresholdMs: MAX_SPEECH_SEGMENT_MS,
+            thresholdMs: resolvedRuntimeConfig.maxSpeechSegmentMs,
           });
           session.sendAudioStreamEnd('max_speech_commit');
           maybeSendTranscriptFallback('max_speech_commit');
@@ -1069,16 +1954,89 @@ export function useVoiceAssistantController({
 
       const silenceMs = now - lastTalkingAtRef.current;
       const sinceLastSignalMs = now - lastTurnEndSignalAtRef.current;
-      if (silenceMs >= TURN_END_SILENCE_MS && sinceLastSignalMs >= 500) {
+      if (
+        silenceMs >= resolvedRuntimeConfig.turnEndSilenceMs &&
+        sinceLastSignalMs >= 500
+      ) {
         lastTurnEndSignalAtRef.current = now;
         wasTalkingRef.current = false;
         speechStartAtRef.current = 0;
         voiceDebugLog('turn.silence_commit', {
           silenceMs,
-          thresholdMs: TURN_END_SILENCE_MS,
+          thresholdMs: resolvedRuntimeConfig.turnEndSilenceMs,
         });
         session.sendAudioStreamEnd('silence_commit');
         maybeSendTranscriptFallback('silence_commit');
+        if (silenceHandoffTimerRef.current) {
+          clearTimeout(silenceHandoffTimerRef.current);
+        }
+        const isAgentBusyNow = isAgentBusyRef.current();
+        const silenceHandoffDelayMs = isAgentBusyNow
+          ? SILENCE_HANDOFF_BUSY_FALLBACK_MS
+          : SILENCE_HANDOFF_FALLBACK_MS;
+        silenceHandoffTimerRef.current = setTimeout(() => {
+          if (!active) {
+            return;
+          }
+          const transcript = latestInputTranscriptRef.current.trim();
+          if (!shouldAutoHandoffToCodingAgent(transcript)) {
+            return;
+          }
+          if (transcript === lastAutoHandoffTranscriptRef.current) {
+            return;
+          }
+          if (wasRecentlySubmitted(transcript)) {
+            return;
+          }
+
+          const currentNow = Date.now();
+          const sinceLastToolCall = currentNow - lastToolCallAtRef.current;
+          const sinceLastOutput = currentNow - lastOutputAtRef.current;
+          const sinceLastInput = currentNow - lastInputAtRef.current;
+          const minHandoffCooldownMs = isAgentBusyRef.current()
+            ? SILENCE_HANDOFF_BUSY_FALLBACK_MS
+            : SILENCE_HANDOFF_FALLBACK_MS;
+          if (
+            sinceLastToolCall < minHandoffCooldownMs ||
+            sinceLastOutput < minHandoffCooldownMs ||
+            sinceLastInput < resolvedRuntimeConfig.turnEndSilenceMs
+          ) {
+            return;
+          }
+
+          lastAutoHandoffTranscriptRef.current = transcript;
+          lastToolCallAtRef.current = currentNow;
+          voiceDebugLog('silence_handoff.submit_request', {
+            transcript,
+            sinceLastToolCall,
+            sinceLastOutput,
+            sinceLastInput,
+          });
+          void submitUserRequestRef
+            .current(transcript)
+            .then((result) => {
+              if (!active) {
+                return;
+              }
+              markSubmittedRequest(transcript);
+              const message =
+                (typeof result === 'string' && result.trim()) ||
+                'Submitted your request to the coding agent.';
+              const at = Date.now();
+              setLastOutputAt(at);
+              lastOutputAtRef.current = at;
+              muteModelOutputUntilRef.current = at + POST_TOOL_MODEL_MUTE_MS;
+              setState((prev) => ({
+                ...prev,
+                outputTranscript: message,
+              }));
+            })
+            .catch((error) => {
+              voiceDebugLog('silence_handoff.submit_request.failed', {
+                message: getErrorMessage(error),
+              });
+            });
+        }, silenceHandoffDelayMs);
       }
     });
 
@@ -1098,6 +2056,12 @@ export function useVoiceAssistantController({
 
       try {
         const model = await session.start({
+          model: resolvedRuntimeConfig.model,
+          inputTranscriptionLanguageCode:
+            resolvedRuntimeConfig.inputTranscriptionLanguageCode,
+          advancedVad: resolvedRuntimeConfig.advancedVad,
+          serverSilenceMs: resolvedRuntimeConfig.serverSilenceMs,
+          setupWaitMs: resolvedRuntimeConfig.setupWaitMs,
           tools: VOICE_ASSISTANT_TOOLS,
           systemInstruction: VOICE_ASSISTANT_SYSTEM_INSTRUCTION,
         });
@@ -1132,6 +2096,16 @@ export function useVoiceAssistantController({
         clearTimeout(localFallbackTimerRef.current);
         localFallbackTimerRef.current = null;
       }
+      if (autoHandoffTimerRef.current) {
+        clearTimeout(autoHandoffTimerRef.current);
+        autoHandoffTimerRef.current = null;
+      }
+      if (silenceHandoffTimerRef.current) {
+        clearTimeout(silenceHandoffTimerRef.current);
+        silenceHandoffTimerRef.current = null;
+      }
+      localSpeechActiveRef.current = false;
+      localSpeechInputGuardUntilRef.current = 0;
       unsubscribePcm();
       unsubscribeAudioState();
       session.off('open', onOpen);
@@ -1145,17 +2119,7 @@ export function useVoiceAssistantController({
       sessionRef.current = null;
       playbackRef.current = null;
     };
-  }, [
-    cancelCurrentRun,
-    config,
-    enabled,
-    getPendingActions,
-    getRuntimeStatus,
-    onDisableRequested,
-    resolvePendingAction,
-    submitUserHint,
-    submitUserRequest,
-  ]);
+  }, [config, enabled, resolvedRuntimeConfig, speak]);
 
   return {
     ...state,
@@ -1168,6 +2132,7 @@ interface HandleAssistantToolCallParams {
   call: FunctionCall;
   getRuntimeStatus: () => string;
   getPendingActions: () => VoicePendingAction[];
+  getFallbackUserRequestText: () => string;
   submitUserRequest: (text: string) => Promise<string | void>;
   submitUserHint: (text: string) => Promise<string | void> | string | void;
   resolvePendingAction: (
@@ -1184,6 +2149,7 @@ async function handleAssistantToolCall(
     call,
     getRuntimeStatus,
     getPendingActions,
+    getFallbackUserRequestText,
     submitUserRequest,
     submitUserHint,
     resolvePendingAction,
@@ -1208,6 +2174,42 @@ async function handleAssistantToolCall(
           response: { actions: getPendingActions() },
         };
       case 'query_local_context': {
+        const query = asStringArg(args['query']);
+        const fallbackRequestText = getFallbackUserRequestText().trim();
+        if (isGitDelegationIntent(query, fallbackRequestText)) {
+          const delegatedText =
+            fallbackRequestText || 'List uncommitted files in this workspace.';
+          const submitResult = await submitUserRequest(delegatedText);
+          return {
+            id: call.id,
+            name,
+            response: {
+              ok: true,
+              delegated: true,
+              submittedText: delegatedText,
+              message:
+                submitResult || 'Submitted your request to the coding agent.',
+            },
+          };
+        }
+        if (
+          !isLocalContextQuery(query) &&
+          fallbackRequestText &&
+          shouldAutoHandoffToCodingAgent(fallbackRequestText)
+        ) {
+          const submitResult = await submitUserRequest(fallbackRequestText);
+          return {
+            id: call.id,
+            name,
+            response: {
+              ok: true,
+              delegated: true,
+              submittedText: fallbackRequestText,
+              message:
+                submitResult || 'Submitted your request to the coding agent.',
+            },
+          };
+        }
         const result = await runLocalContextQuery(args);
         return {
           id: call.id,
@@ -1216,7 +2218,14 @@ async function handleAssistantToolCall(
         };
       }
       case 'submit_user_request': {
-        const text = asStringArg(args['text']);
+        const argText = asStringArg(args['text']);
+        const fallbackText = getFallbackUserRequestText().trim();
+        const text = argText || fallbackText;
+        if (!argText && fallbackText) {
+          voiceDebugLog('tool.submit_user_request.fallback_text', {
+            text: fallbackText,
+          });
+        }
         if (!text) {
           return {
             id: call.id,
@@ -1230,9 +2239,9 @@ async function handleAssistantToolCall(
             name,
             response: {
               ok: false,
-              needsClarification: true,
-              question:
-                'I caught a partial phrase. Please say your full request in one sentence.',
+              partialUtterance: true,
+              message:
+                'Partial utterance detected. Wait for additional user speech before responding.',
             },
           };
         }
@@ -1242,6 +2251,7 @@ async function handleAssistantToolCall(
           name,
           response: {
             ok: true,
+            submittedText: text,
             message: result || 'Submitted the request to the coding agent.',
           },
         };
@@ -1266,16 +2276,39 @@ async function handleAssistantToolCall(
         };
       }
       case 'resolve_pending_action': {
-        const decision = asStringArg(args['decision']);
-        if (!decision) {
+        const rawDecision = asStringArg(args['decision']);
+        if (!rawDecision) {
           return {
             id: call.id,
             name,
             response: { ok: false, message: 'Missing decision.' },
           };
         }
+        const actionId = asStringArg(args['actionId']) || undefined;
+        const pendingActions = getPendingActions();
+        const targetAction = actionId
+          ? pendingActions.find((action) => action.id === actionId)
+          : pendingActions[0];
+        let decision = rawDecision.toLowerCase();
+        if (targetAction && !targetAction.allowedDecisions.includes(decision)) {
+          const intent = detectSimpleDecision(rawDecision);
+          if (intent) {
+            const mapped = pickDecisionForIntent(
+              targetAction.allowedDecisions,
+              intent,
+            );
+            if (mapped) {
+              voiceDebugLog('tool.resolve_pending_action.decision_mapped', {
+                original: rawDecision,
+                mapped,
+                actionId: targetAction.id,
+              });
+              decision = mapped;
+            }
+          }
+        }
         const request: ResolvePendingActionRequest = {
-          actionId: asStringArg(args['actionId']) || undefined,
+          actionId,
           decision,
           answers: asAnswersArg(args['answers']),
           feedback: asStringArg(args['feedback']) || undefined,

@@ -172,6 +172,7 @@ import { VoiceAssistantContextProvider } from './contexts/VoiceAssistantContext.
 import {
   useVoiceAssistantController,
   type ResolvePendingActionRequest,
+  type VoiceAssistantRuntimeConfig,
 } from './hooks/useVoiceAssistantController.js';
 import {
   buildRuntimeStatusSummary,
@@ -202,6 +203,216 @@ function isToolAwaitingConfirmation(
         (tool) => CoreToolCallStatus.AwaitingApproval === tool.status,
       ),
     );
+}
+
+const VOICE_AGENT_HANDOFF_PROTOCOL = 'voice-agent-handoff/v1';
+
+function buildVoiceAgentHandoffMessage({
+  kind,
+  utterance,
+  streamingState,
+  pendingActionCount,
+}: {
+  kind: 'request' | 'hint';
+  utterance: string;
+  streamingState: StreamingState;
+  pendingActionCount: number;
+}) {
+  const payload = {
+    protocol: VOICE_AGENT_HANDOFF_PROTOCOL,
+    kind,
+    source: 'voice_assistant',
+    timestamp: new Date().toISOString(),
+    streamingState,
+    pendingActionCount,
+    utterance,
+  };
+
+  return [
+    '[VOICE_AGENT_HANDOFF_V1]',
+    JSON.stringify(payload),
+    '[/VOICE_AGENT_HANDOFF_V1]',
+    '',
+    utterance,
+  ].join('\n');
+}
+
+function sanitizeVoiceAnnouncementText(text: string) {
+  return text
+    .replace(
+      /\[VOICE_AGENT_HANDOFF_V1\][\s\S]*?\[\/VOICE_AGENT_HANDOFF_V1\]/g,
+      '',
+    )
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/^\s*[-*]\s+/gm, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function shortenVoiceSnippet(text: string, maxChars: number) {
+  const trimmed = text.trim();
+  if (trimmed.length <= maxChars) {
+    return trimmed;
+  }
+  return `${trimmed.slice(0, maxChars - 3)}...`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function extractUniqueFilePaths(text: string): string[] {
+  const matches = text.match(
+    /\b(?:[a-zA-Z0-9._-]+\/)+[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+\b/g,
+  );
+  if (!matches || matches.length === 0) {
+    return [];
+  }
+  return Array.from(new Set(matches));
+}
+
+function formatPathForSpeech(filePath: string) {
+  return filePath.startsWith('src/') ? `from ${filePath}` : `in ${filePath}`;
+}
+
+function buildFriendlyVoiceCompletionSummary(rawText: string): string | null {
+  const cleaned = sanitizeVoiceAnnouncementText(rawText);
+  if (!cleaned) {
+    return null;
+  }
+
+  const normalized = cleaned.toLowerCase();
+  const filePaths = extractUniqueFilePaths(cleaned);
+  const soundsLikeChangeSummary =
+    filePaths.length > 0 &&
+    (normalized.includes('uncommitted') ||
+      normalized.includes('changed') ||
+      normalized.includes('modified') ||
+      normalized.includes('untracked'));
+
+  if (soundsLikeChangeSummary) {
+    if (filePaths.length === 1) {
+      return `I found one changed file ${formatPathForSpeech(filePaths[0])}.`;
+    }
+
+    const preview = filePaths
+      .slice(0, 2)
+      .map(formatPathForSpeech)
+      .join(' and ');
+    return `I found changes in ${filePaths.length} files, including ${preview}.`;
+  }
+
+  if (filePaths.length > 2) {
+    const preview = filePaths
+      .slice(0, 2)
+      .map(formatPathForSpeech)
+      .join(' and ');
+    return `I found ${filePaths.length} relevant files, including ${preview}.`;
+  }
+
+  return shortenVoiceSnippet(cleaned, 260);
+}
+
+function getLatestCompletedToolSummary(history: HistoryItem[]): string | null {
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const item = history[index];
+    if (item.type !== 'tool_group' || item.tools.length === 0) {
+      continue;
+    }
+
+    const completedTool = [...item.tools]
+      .reverse()
+      .find(
+        (tool) =>
+          tool.status === CoreToolCallStatus.Success ||
+          tool.status === CoreToolCallStatus.Error ||
+          tool.status === CoreToolCallStatus.Cancelled,
+      );
+    if (!completedTool) {
+      continue;
+    }
+
+    const baseText = completedTool.description || completedTool.name;
+    const cleaned = sanitizeVoiceAnnouncementText(baseText);
+    if (!cleaned) {
+      continue;
+    }
+    if (
+      completedTool.name === 'run_shell_command' ||
+      cleaned.toLowerCase().startsWith('shell ')
+    ) {
+      const commandMatch = cleaned.match(/^shell\s+(.+?)(?:\s*\[|$)/i);
+      const commandText = commandMatch?.[1]?.trim();
+      if (commandText) {
+        return shortenVoiceSnippet(`the command ${commandText}`, 130);
+      }
+      return 'a shell command';
+    }
+    return shortenVoiceSnippet(cleaned, 130);
+  }
+
+  return null;
+}
+
+function getLatestVoiceRequestContext(history: HistoryItem[]): string | null {
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const item = history[index];
+    if (item.type !== 'user' || typeof item.text !== 'string') {
+      continue;
+    }
+
+    const match = item.text.match(
+      /\[VOICE_AGENT_HANDOFF_V1\]\s*([\s\S]*?)\s*\[\/VOICE_AGENT_HANDOFF_V1\]/,
+    );
+    if (!match?.[1]) {
+      continue;
+    }
+
+    try {
+      const parsed: unknown = JSON.parse(match[1]);
+      if (!isRecord(parsed)) {
+        continue;
+      }
+      const payload = parsed;
+      if (
+        payload['kind'] === 'request' &&
+        typeof payload['utterance'] === 'string' &&
+        payload['utterance'].trim().length > 0
+      ) {
+        return shortenVoiceSnippet(payload['utterance'].trim(), 90);
+      }
+    } catch {
+      // Ignore malformed handoff payloads.
+    }
+  }
+
+  return null;
+}
+
+function getLatestAssistantTurnText(history: HistoryItem[]): string | null {
+  const collected: string[] = [];
+
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const item = history[index];
+    if (item.type === 'gemini' || item.type === 'gemini_content') {
+      const text = typeof item.text === 'string' ? item.text.trim() : '';
+      if (text) {
+        collected.push(text);
+      }
+      continue;
+    }
+
+    if (collected.length > 0) {
+      break;
+    }
+  }
+
+  if (collected.length === 0) {
+    return null;
+  }
+
+  return collected.reverse().join(' ').replace(/\s+/g, ' ').trim();
 }
 
 interface AppContainerProps {
@@ -2183,10 +2394,45 @@ Logging in with Google... Restarting Gemini CLI to continue.
   );
 
   const [voiceAssistantEnabled, setVoiceAssistantEnabled] = useState(false);
+  const voiceAssistantRuntimeConfig = useMemo<VoiceAssistantRuntimeConfig>(
+    () => ({
+      model: settings.merged.ui.voiceAssistant.model,
+      inputTranscriptionLanguageCode:
+        settings.merged.ui.voiceAssistant.inputTranscriptionLanguageCode,
+      forceTurnEndOnSilence:
+        settings.merged.ui.voiceAssistant.forceTurnEndOnSilence,
+      turnEndSilenceMs: settings.merged.ui.voiceAssistant.turnEndSilenceMs,
+      maxSpeechSegmentMs: settings.merged.ui.voiceAssistant.maxSpeechSegmentMs,
+      transcriptTurnFallback:
+        settings.merged.ui.voiceAssistant.transcriptTurnFallback,
+      transcriptTurnCooldownMs:
+        settings.merged.ui.voiceAssistant.transcriptTurnCooldownMs,
+      localAssistantFallback:
+        settings.merged.ui.voiceAssistant.localAssistantFallback,
+      localAssistantFallbackMs:
+        settings.merged.ui.voiceAssistant.localAssistantFallbackMs,
+      advancedVad: settings.merged.ui.voiceAssistant.advancedVad,
+      serverSilenceMs: settings.merged.ui.voiceAssistant.serverSilenceMs,
+      setupWaitMs: settings.merged.ui.voiceAssistant.setupWaitMs,
+    }),
+    [
+      settings.merged.ui.voiceAssistant.advancedVad,
+      settings.merged.ui.voiceAssistant.forceTurnEndOnSilence,
+      settings.merged.ui.voiceAssistant.inputTranscriptionLanguageCode,
+      settings.merged.ui.voiceAssistant.localAssistantFallback,
+      settings.merged.ui.voiceAssistant.localAssistantFallbackMs,
+      settings.merged.ui.voiceAssistant.maxSpeechSegmentMs,
+      settings.merged.ui.voiceAssistant.model,
+      settings.merged.ui.voiceAssistant.serverSilenceMs,
+      settings.merged.ui.voiceAssistant.setupWaitMs,
+      settings.merged.ui.voiceAssistant.transcriptTurnCooldownMs,
+      settings.merged.ui.voiceAssistant.transcriptTurnFallback,
+      settings.merged.ui.voiceAssistant.turnEndSilenceMs,
+    ],
+  );
 
   useEffect(() => {
     voiceDebugLog('app.voice_debug_probe', {
-      sandbox: process.env['SANDBOX'] || null,
       cwd: process.cwd(),
     });
   }, []);
@@ -2251,12 +2497,26 @@ Logging in with Google... Restarting Gemini CLI to continue.
     ],
   );
 
+  const isVoiceAgentBusy = useCallback(
+    () =>
+      streamingState === StreamingState.Responding ||
+      isToolExecuting(pendingHistoryItems) ||
+      hasPendingActionRequired,
+    [streamingState, pendingHistoryItems, hasPendingActionRequired],
+  );
+
   const submitVoiceHint = useCallback(
     (hint: string) => {
       const trimmed = hint.trim();
       if (!trimmed) {
-        return 'Hint was empty.';
+        return 'I did not catch that update clearly. Can you repeat it?';
       }
+      const handoffHint = buildVoiceAgentHandoffMessage({
+        kind: 'hint',
+        utterance: trimmed,
+        streamingState,
+        pendingActionCount: getPendingVoiceActions().length,
+      });
 
       (
         config.userHintService as {
@@ -2265,21 +2525,21 @@ Logging in with Google... Restarting Gemini CLI to continue.
             options?: { force?: boolean },
           ) => void;
         }
-      ).addUserHint(trimmed, { force: true });
+      ).addUserHint(handoffHint, { force: true });
       historyManager.addItem({
         type: 'hint',
         text: trimmed,
       });
-      return 'Added your update as a live hint.';
+      return 'Got it. I shared that with the running agent.';
     },
-    [config, historyManager],
+    [config, getPendingVoiceActions, historyManager, streamingState],
   );
 
   const submitVoiceUserRequest = useCallback(
     async (text: string) => {
       const trimmed = text.trim();
       if (!trimmed) {
-        return 'Request was empty.';
+        return 'I did not catch a clear request yet.';
       }
 
       const isAgentRunning =
@@ -2288,32 +2548,44 @@ Logging in with Google... Restarting Gemini CLI to continue.
 
       if (isAgentRunning) {
         submitVoiceHint(trimmed);
-        return 'Agent is already running. I added your update as a live hint.';
+        return 'Perfect. I added that while the current run keeps going.';
       }
 
-      await handleFinalSubmit(trimmed);
-      return 'Submitted your request to the coding agent.';
+      const handoffRequest = buildVoiceAgentHandoffMessage({
+        kind: 'request',
+        utterance: trimmed,
+        streamingState,
+        pendingActionCount: getPendingVoiceActions().length,
+      });
+      await handleFinalSubmit(handoffRequest);
+      return "On it. I'll check that and report back.";
     },
-    [streamingState, pendingHistoryItems, submitVoiceHint, handleFinalSubmit],
+    [
+      streamingState,
+      pendingHistoryItems,
+      getPendingVoiceActions,
+      submitVoiceHint,
+      handleFinalSubmit,
+    ],
   );
 
   const resolveVoicePendingAction = useCallback(
     async (request: ResolvePendingActionRequest) => {
       const pendingActions = getPendingVoiceActions();
       if (pendingActions.length === 0) {
-        return 'There are no pending approvals right now.';
+        return 'No approvals are waiting right now.';
       }
 
       const targetAction = request.actionId
         ? pendingActions.find((action) => action.id === request.actionId)
         : pendingActions[0];
       if (!targetAction) {
-        return `No pending action matches "${request.actionId}".`;
+        return `I could not find that pending action: "${request.actionId}".`;
       }
 
       const decision = request.decision.trim().toLowerCase();
       if (!targetAction.allowedDecisions.includes(decision)) {
-        return `Invalid decision for this action. Allowed: ${targetAction.allowedDecisions.join(', ')}.`;
+        return `That choice is not valid here. You can say: ${targetAction.allowedDecisions.join(', ')}.`;
       }
 
       if (targetAction.type === 'tool') {
@@ -2321,7 +2593,7 @@ Logging in with Google... Restarting Gemini CLI to continue.
           (tool) => tool.callId === targetAction.toolCallId,
         );
         if (!toolCall) {
-          return 'Could not find the pending tool confirmation.';
+          return 'I could not find the pending tool confirmation.';
         }
 
         const details = toolCall.confirmationDetails;
@@ -2388,7 +2660,7 @@ Logging in with Google... Restarting Gemini CLI to continue.
         }
 
         if (!outcome) {
-          return `Unable to apply decision "${decision}" for this tool.`;
+          return `I could not apply "${decision}" to that tool request.`;
         }
 
         const result = await resolveToolConfirmation({
@@ -2399,26 +2671,44 @@ Logging in with Google... Restarting Gemini CLI to continue.
           payload,
         });
         if (result !== 'resolved') {
-          return 'Could not resolve the pending tool action.';
+          return 'I could not resolve that tool action.';
         }
-
-        return `Applied decision "${decision}" to the pending tool action.`;
+        switch (decision) {
+          case 'allow_once':
+            return 'Okay, running it now.';
+          case 'allow_session':
+            return 'Okay, approved for this session.';
+          case 'allow_always':
+            return 'Okay, approved always for this command.';
+          case 'allow_tool_session':
+            return 'Okay, approved this tool for this session.';
+          case 'allow_server_session':
+            return 'Okay, approved this server for this session.';
+          case 'modify':
+            return "Okay, let's modify it before running.";
+          case 'cancel':
+            return 'Okay, denied. I will not run it.';
+          case 'answer':
+            return 'Got it. I sent your answer.';
+          default:
+            return 'Done. I applied your decision.';
+        }
       }
 
       if (targetAction.type === 'command') {
         const confirmed = decision === 'allow';
         commandConfirmationRequest?.onConfirm(confirmed);
         return confirmed
-          ? 'Approved the pending command.'
-          : 'Rejected the pending command.';
+          ? 'Okay, approved. Running it now.'
+          : 'Okay, denied. I will not run it.';
       }
 
       if (targetAction.type === 'auth') {
         const confirmed = decision === 'allow';
         authConsentRequest?.onConfirm(confirmed);
         return confirmed
-          ? 'Approved the authentication request.'
-          : 'Rejected the authentication request.';
+          ? 'Okay, approved the authentication request.'
+          : 'Okay, denied the authentication request.';
       }
 
       if (targetAction.type === 'permission') {
@@ -2426,16 +2716,16 @@ Logging in with Google... Restarting Gemini CLI to continue.
           allowed: decision === 'allow',
         });
         return decision === 'allow'
-          ? 'Granted the filesystem permission request.'
-          : 'Denied the filesystem permission request.';
+          ? 'Okay, approved. Continuing with filesystem access.'
+          : 'Okay, denied filesystem access.';
       }
 
       if (targetAction.type === 'extension_update') {
         const requestHead = confirmUpdateExtensionRequests[0];
         requestHead?.onConfirm(decision === 'allow');
         return decision === 'allow'
-          ? 'Approved the extension update request.'
-          : 'Rejected the extension update request.';
+          ? 'Okay, approved that extension update.'
+          : 'Okay, denied that extension update.';
       }
 
       if (targetAction.type === 'loop_detection') {
@@ -2443,8 +2733,8 @@ Logging in with Google... Restarting Gemini CLI to continue.
           userSelection: decision === 'disable' ? 'disable' : 'keep',
         });
         return decision === 'disable'
-          ? 'Disabled loop detection for this session and continued.'
-          : 'Kept loop detection enabled.';
+          ? 'Okay, disabled loop detection and continued.'
+          : 'Okay, kept loop detection enabled.';
       }
 
       return 'Unsupported pending action type.';
@@ -2464,6 +2754,8 @@ Logging in with Google... Restarting Gemini CLI to continue.
   const voiceAssistantController = useVoiceAssistantController({
     config,
     enabled: voiceAssistantEnabled,
+    runtimeConfig: voiceAssistantRuntimeConfig,
+    isAgentBusy: isVoiceAgentBusy,
     onDisableRequested: disableVoiceAssistant,
     getRuntimeStatus: getRuntimeVoiceStatus,
     getPendingActions: getPendingVoiceActions,
@@ -2494,6 +2786,42 @@ Logging in with Google... Restarting Gemini CLI to continue.
       hasLoopDetectionConfirmationRequest,
     ],
   );
+
+  const latestVoiceCompletionSummary = useMemo(() => {
+    const latestTurnText = getLatestAssistantTurnText(historyManager.history);
+    if (!latestTurnText) {
+      return null;
+    }
+
+    return buildFriendlyVoiceCompletionSummary(latestTurnText);
+  }, [historyManager.history]);
+  const latestVoiceToolSummary = useMemo(
+    () => getLatestCompletedToolSummary(historyManager.history),
+    [historyManager.history],
+  );
+  const latestVoiceRequestContext = useMemo(
+    () => getLatestVoiceRequestContext(historyManager.history),
+    [historyManager.history],
+  );
+
+  const latestVoiceCompletionSummaryRef = useRef<string | null>(
+    latestVoiceCompletionSummary,
+  );
+  const latestVoiceToolSummaryRef = useRef<string | null>(
+    latestVoiceToolSummary,
+  );
+  const latestVoiceRequestContextRef = useRef<string | null>(
+    latestVoiceRequestContext,
+  );
+  useEffect(() => {
+    latestVoiceCompletionSummaryRef.current = latestVoiceCompletionSummary;
+    latestVoiceToolSummaryRef.current = latestVoiceToolSummary;
+    latestVoiceRequestContextRef.current = latestVoiceRequestContext;
+  }, [
+    latestVoiceCompletionSummary,
+    latestVoiceToolSummary,
+    latestVoiceRequestContext,
+  ]);
 
   const lastVoiceAttentionKeyRef = useRef<string | null>(null);
   useEffect(() => {
@@ -2530,6 +2858,15 @@ Logging in with Google... Restarting Gemini CLI to continue.
   ]);
 
   const previousStreamingStateForVoiceRef = useRef(streamingState);
+  const completionAnnouncementTimerRef = useRef<NodeJS.Timeout | null>(null);
+  useEffect(
+    () => () => {
+      if (completionAnnouncementTimerRef.current) {
+        clearTimeout(completionAnnouncementTimerRef.current);
+      }
+    },
+    [],
+  );
   useEffect(() => {
     const previousState = previousStreamingStateForVoiceRef.current;
     previousStreamingStateForVoiceRef.current = streamingState;
@@ -2542,6 +2879,10 @@ Logging in with Google... Restarting Gemini CLI to continue.
       previousState === StreamingState.Idle &&
       streamingState === StreamingState.Responding;
     if (justStartedTurn) {
+      if (completionAnnouncementTimerRef.current) {
+        clearTimeout(completionAnnouncementTimerRef.current);
+        completionAnnouncementTimerRef.current = null;
+      }
       speakVoiceAnnouncement('Started working on your request.');
       return;
     }
@@ -2552,8 +2893,30 @@ Logging in with Google... Restarting Gemini CLI to continue.
     if (!justCompletedTurn || hasPendingActionRequired) {
       return;
     }
-
-    speakVoiceAnnouncement('Coding agent run complete.');
+    if (completionAnnouncementTimerRef.current) {
+      clearTimeout(completionAnnouncementTimerRef.current);
+    }
+    completionAnnouncementTimerRef.current = setTimeout(() => {
+      completionAnnouncementTimerRef.current = null;
+      const completionSummary = latestVoiceCompletionSummaryRef.current;
+      const toolSummary = latestVoiceToolSummaryRef.current;
+      const requestContext = latestVoiceRequestContextRef.current;
+      const summaryParts = ['Done.'];
+      if (requestContext) {
+        summaryParts.push(`For "${requestContext}",`);
+      }
+      if (toolSummary) {
+        summaryParts.push(`I ran ${toolSummary}.`);
+      }
+      if (completionSummary) {
+        summaryParts.push(completionSummary);
+      }
+      if (!completionSummary && !toolSummary) {
+        summaryParts.push('The coding run is complete.');
+      }
+      const completionText = summaryParts.join(' ').replace(/\s+/g, ' ').trim();
+      speakVoiceAnnouncement(completionText);
+    }, 250);
   }, [
     streamingState,
     hasPendingActionRequired,
