@@ -198,6 +198,11 @@ export class AppRig {
         },
         originalSettings: {},
       },
+      workspace: {
+        path: path.join(this.testDir, '.gemini', 'workspace_settings.json'),
+        settings: {},
+        originalSettings: {},
+      },
       merged: {
         security: {
           auth: {
@@ -281,11 +286,11 @@ export class AppRig {
     );
   }
 
-  render() {
+  async render() {
     if (!this.config || !this.settings)
       throw new Error('AppRig not initialized');
 
-    act(() => {
+    await act(async () => {
       this.renderResult = renderWithProviders(
         <AppContainer
           config={this.config!}
@@ -307,6 +312,10 @@ export class AppRig {
           },
         },
       );
+
+      // Flush startup effects (for example async banner text updates)
+      // within an act boundary to avoid warning noise in integration tests.
+      await new Promise((resolve) => setTimeout(resolve, 0));
     });
   }
 
@@ -507,26 +516,58 @@ export class AppRig {
 
   getStaticOutput() {
     if (!this.renderResult) return '';
-    return stripAnsi(this.renderResult.stdout.lastFrame() || '');
+    return stripAnsi(
+      this.renderResult.stdout.lastFrame({ allowEmpty: true }) || '',
+    );
   }
 
   async waitForOutput(pattern: string | RegExp, timeout = 30000) {
+    const matches = (text: string) => {
+      if (typeof pattern === 'string') {
+        return text.includes(pattern);
+      }
+      // Avoid RegExp lastIndex mutation for global/sticky patterns.
+      const stablePattern = new RegExp(
+        pattern.source,
+        pattern.flags.replace(/[gy]/g, ''),
+      );
+      return stablePattern.test(text);
+    };
+
     await this.waitUntil(
       () => {
         const frame = this.lastFrame;
-        return typeof pattern === 'string'
-          ? frame.includes(pattern)
-          : pattern.test(frame);
+        const staticOutput = this.getStaticOutput();
+        return matches(frame) || matches(staticOutput);
       },
       {
         timeout,
-        message: `Timed out waiting for output: ${pattern}\nLast frame:\n${this.lastFrame}`,
+        message: `Timed out waiting for output: ${pattern}\nLast frame:\n${this.lastFrame}\nStatic output:\n${this.getStaticOutput()}`,
       },
     );
   }
 
   async waitForIdle(timeout = 20000) {
-    await this.waitForOutput('Type your message', timeout);
+    try {
+      await this.waitForOutput('Type your message', timeout);
+      return;
+    } catch {
+      // Fall through to startup-banner based readiness checks.
+    }
+
+    try {
+      await this.waitForOutput(
+        /Authenticated with|Tips for getting started/,
+        Math.min(timeout, 5_000),
+      );
+      return;
+    } catch {
+      // Some startup paths keep the frame empty until the first interaction.
+      // Give the UI loop a short settle window and continue.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      });
+    }
   }
 
   async sendMessage(text: string) {

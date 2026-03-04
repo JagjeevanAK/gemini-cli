@@ -10,16 +10,6 @@ exports[`ApprovalModeIndicator > renders correctly for AUTO_EDIT mode with plan 
 "
 `;
 
-exports[`ApprovalModeIndicator > renders correctly for DEFAULT mode 1`] = `
-"shift+tab to accept edits
-"
-`;
-
-exports[`ApprovalModeIndicator > renders correctly for DEFAULT mode with plan enabled 1`] = `
-"shift+tab to accept edits
-"
-`;
-
 exports[`ApprovalModeIndicator > renders correctly for PLAN mode 1`] = `
 "plan shift+tab to manual
 "

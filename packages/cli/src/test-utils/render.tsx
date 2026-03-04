@@ -653,11 +653,20 @@ export const renderWithProviders = (
   const terminalWidth = width ?? baseState.terminalWidth;
   let finalSettings = settings;
   if (useAlternateBuffer !== undefined) {
+    const snapshot = settings.getSnapshot();
     finalSettings = createMockSettings({
-      ...settings.merged,
-      ui: {
-        ...settings.merged.ui,
-        useAlternateBuffer,
+      system: snapshot.system,
+      systemDefaults: snapshot.systemDefaults,
+      user: snapshot.user,
+      workspace: snapshot.workspace,
+      isTrusted: snapshot.isTrusted,
+      errors: snapshot.errors,
+      merged: {
+        ...settings.merged,
+        ui: {
+          ...settings.merged.ui,
+          useAlternateBuffer,
+        },
       },
     });
   }
