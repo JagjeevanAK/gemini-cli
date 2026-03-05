@@ -351,6 +351,7 @@ function* emitKeys(
     let cmd = false;
     let code = undefined;
     let insertable = false;
+    let phase: Key['phase'];
 
     if (ch === ESC) {
       escaped = true;
@@ -489,6 +490,16 @@ function* emitKeys(
               ch = yield;
               sequence += ch;
             }
+
+            // Kitty protocol may append sub-parameters with ":".
+            while (ch === ':') {
+              ch = yield;
+              sequence += ch;
+              while (ch >= '0' && ch <= '9') {
+                ch = yield;
+                sequence += ch;
+              }
+            }
           }
         } else if (ch === '<') {
           // SGR mouse mode
@@ -517,20 +528,47 @@ function* emitKeys(
         const cmd = sequence.slice(cmdStart);
         let match;
 
-        if ((match = /^(\d+)(?:;(\d+))?(?:;(\d+))?([~^$u])$/.exec(cmd))) {
-          if (match[1] === '27' && match[3] && match[4] === '~') {
+        if (
+          (match = /^(\d+)(?:;(\d+)(?::(\d+))?)?(?:;(\d+))?([~^$u])$/.exec(cmd))
+        ) {
+          if (match[1] === '27' && match[4] && match[5] === '~') {
             // modifyOtherKeys format: CSI 27 ; modifier ; key ~
             // Treat as CSI u: key + 'u'
-            code += match[3] + 'u';
+            code += match[4] + 'u';
             modifier = parseInt(match[2] ?? '1', 10) - 1;
           } else {
-            code += match[1] + match[4];
+            code += match[1] + match[5];
             // Defaults to '1' if no modifier exists, resulting in a 0 modifier value
             modifier = parseInt(match[2] ?? '1', 10) - 1;
+            // Kitty protocol key event type: 1=press, 2=repeat, 3=release.
+            const eventTypeRaw = match[3] ?? match[4];
+            if (match[5] === 'u' && eventTypeRaw) {
+              const eventType = parseInt(eventTypeRaw, 10);
+              if (eventType === 1) {
+                phase = 'press';
+              } else if (eventType === 2) {
+                phase = 'repeat';
+              } else if (eventType === 3) {
+                phase = 'release';
+              }
+            }
           }
-        } else if ((match = /^(\d+)?(?:;(\d+))?([A-Za-z])$/.exec(cmd))) {
-          code += match[3];
+        } else if (
+          (match = /^(\d+)?(?:;(\d+)(?::(\d+))?)?([A-Za-z])$/.exec(cmd))
+        ) {
+          code += match[4];
           modifier = parseInt(match[2] ?? match[1] ?? '1', 10) - 1;
+          const eventTypeRaw = match[3];
+          if (eventTypeRaw) {
+            const eventType = parseInt(eventTypeRaw, 10);
+            if (eventType === 1) {
+              phase = 'press';
+            } else if (eventType === 2) {
+              phase = 'repeat';
+            } else if (eventType === 3) {
+              phase = 'release';
+            }
+          }
         } else {
           code += cmd;
         }
@@ -654,7 +692,13 @@ function* emitKeys(
       (sequence.length !== 0 && (name !== undefined || escaped)) ||
       charLengthAt(sequence, 0) === sequence.length
     ) {
-      keypressHandler({
+      const isCmdGChord = name === 'g' && cmd && !ctrl && !alt;
+      // Preserve existing behavior for most keys: suppress kitty repeat/release
+      // events globally, and only expose phases for the push-to-talk chord.
+      if (phase && phase !== 'press' && !isCmdGChord) {
+        continue;
+      }
+      const keyEvent: Key = {
         name: name || '',
         shift,
         alt,
@@ -662,7 +706,11 @@ function* emitKeys(
         cmd,
         insertable,
         sequence,
-      });
+      };
+      if (phase && isCmdGChord) {
+        keyEvent.phase = phase;
+      }
+      keypressHandler(keyEvent);
     }
     // Unrecognized or broken escape sequence, don't emit anything
   }
@@ -676,6 +724,8 @@ export interface Key {
   cmd: boolean; // Command/Windows/Super key
   insertable: boolean;
   sequence: string;
+  /** Optional keyboard phase when available from terminal protocol. */
+  phase?: 'press' | 'repeat' | 'release';
 }
 
 export type KeypressHandler = (key: Key) => boolean | void;
