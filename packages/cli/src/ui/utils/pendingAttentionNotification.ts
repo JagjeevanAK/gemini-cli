@@ -29,14 +29,39 @@ function shortenForSpeech(text: string, maxChars: number) {
   return `${cleaned.slice(0, maxChars - 3)}...`;
 }
 
+function getToolDecisionPrompt(
+  details: NonNullable<
+    ReturnType<typeof getConfirmingToolState>
+  >['tool']['confirmationDetails'],
+) {
+  if (!details) {
+    return 'Say "allow once", "allow for this session", "always allow", or "cancel".';
+  }
+
+  switch (details.type) {
+    case 'edit':
+      return 'Say "allow once", "allow for this session", "always allow", "modify", or "cancel".';
+    case 'exec':
+    case 'info':
+      return 'Say "allow once", "allow for this session", "always allow", or "cancel".';
+    case 'mcp':
+      return 'Say "allow once", "allow for this tool", "allow for this server", "always allow", or "cancel".';
+    case 'exit_plan_mode':
+      return 'Say "manual", "auto edit", or "stay in plan".';
+    default:
+      return 'Respond with one of the available options shown in the terminal.';
+  }
+}
+
 function buildToolPermissionDetail(
   details: NonNullable<
     ReturnType<typeof getConfirmingToolState>
   >['tool']['confirmationDetails'],
   fallbackTitle: string | undefined,
 ) {
+  const optionsPrompt = getToolDecisionPrompt(details);
   if (!details) {
-    return 'I need your permission to continue this task. Say "allow" or "deny".';
+    return `I need your permission to continue this task. ${optionsPrompt}`;
   }
 
   if (details.type === 'exec') {
@@ -45,32 +70,32 @@ function buildToolPermissionDetail(
       90,
     );
     if (command) {
-      return `I need permission to run "${command}" to continue this work. Say "allow" or "deny".`;
+      return `I need permission to run "${command}" to continue this work. ${optionsPrompt}`;
     }
-    return 'I need permission to run a command to continue this work. Say "allow" or "deny".';
+    return `I need permission to run a command to continue this work. ${optionsPrompt}`;
   }
 
   if (details.type === 'edit') {
     const fileName = shortenForSpeech(details.fileName, 60);
     return fileName
-      ? `I need permission to edit ${fileName} to complete this work. Say "allow" or "deny".`
-      : 'I need permission to edit a file to complete this work. Say "allow" or "deny".';
+      ? `I need permission to edit ${fileName} to complete this work. ${optionsPrompt}`
+      : `I need permission to edit a file to complete this work. ${optionsPrompt}`;
   }
 
   if (details.type === 'mcp') {
     const toolName = shortenForSpeech(details.toolDisplayName, 60);
     const serverName = shortenForSpeech(details.serverName, 40);
     if (toolName && serverName) {
-      return `I need permission to run ${toolName} on ${serverName} for this task. Say "allow" or "deny".`;
+      return `I need permission to run ${toolName} on ${serverName} for this task. ${optionsPrompt}`;
     }
   }
 
   const title = shortenForSpeech(details.title || fallbackTitle || '', 80);
   if (title) {
-    return `I need your permission for ${title} to continue this task. Say "allow" or "deny".`;
+    return `I need your permission for ${title} to continue this task. ${optionsPrompt}`;
   }
 
-  return 'I need your permission to continue this task. Say "allow" or "deny".';
+  return `I need your permission to continue this task. ${optionsPrompt}`;
 }
 
 function keyFromReactNode(node: ReactNode): string {

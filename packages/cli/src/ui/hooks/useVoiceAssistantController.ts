@@ -27,6 +27,8 @@ export interface VoiceAssistantControllerState {
   connectionState: VoiceConnectionState;
   inputTranscript: string;
   outputTranscript: string;
+  assistantSpeaking: boolean;
+  outputLevel: number;
   model: string | null;
   error: string | null;
   playbackWarning: string | null;
@@ -58,6 +60,7 @@ export interface VoiceAssistantRuntimeConfig {
 interface VoiceAssistantControllerParams {
   config: Config | undefined;
   enabled: boolean;
+  captureAudio: boolean;
   runtimeConfig?: VoiceAssistantRuntimeConfig;
   isAgentBusy: () => boolean;
   onDisableRequested: () => void;
@@ -75,6 +78,8 @@ const INITIAL_STATE: VoiceAssistantControllerState = {
   connectionState: 'idle',
   inputTranscript: '',
   outputTranscript: '',
+  assistantSpeaking: false,
+  outputLevel: 0,
   model: null,
   error: null,
   playbackWarning: null,
@@ -91,19 +96,33 @@ const DEFAULT_LOCAL_ASSISTANT_FALLBACK_MS = 3200;
 const DEFAULT_ADVANCED_VAD = false;
 const DEFAULT_SERVER_SILENCE_MS = 1600;
 const DEFAULT_SETUP_WAIT_MS = 1500;
-const AUTO_HANDOFF_FALLBACK_MS = 1800;
-const AUTO_HANDOFF_BUSY_FALLBACK_MS = 700;
-const SILENCE_HANDOFF_FALLBACK_MS = 1200;
-const SILENCE_HANDOFF_BUSY_FALLBACK_MS = 650;
+const PUSH_TO_TALK_RELEASE_DRAIN_MS = 140;
+const AUTO_HANDOFF_FALLBACK_MS = 1000;
+const AUTO_HANDOFF_BUSY_FALLBACK_MS = 450;
+const SILENCE_HANDOFF_FALLBACK_MS = 700;
+const SILENCE_HANDOFF_BUSY_FALLBACK_MS = 350;
+const MODEL_INTERPRET_SUBMIT_FALLBACK_MS = 2200;
+const DIRECT_DECISION_TAIL_IGNORE_MS = 1800;
 const INPUT_UTTERANCE_WINDOW_MS = 7000;
 const OUTPUT_ECHO_WINDOW_MS = 12000;
 const POST_TOOL_MODEL_MUTE_MS = 2400;
 const REQUEST_DEDUP_WINDOW_MS = 12000;
-const LOCAL_ANNOUNCEMENT_SPEECH_RATE = '195';
+const APPROVAL_REPLY_WINDOW_MS = 20000;
+const SESSION_RECONNECT_RESET_WINDOW_MS = 10000;
+const SESSION_MAX_RECONNECT_ATTEMPTS = 3;
+const LOCAL_ANNOUNCEMENT_SPEECH_RATE = '182';
 const LOCAL_ANNOUNCEMENT_TIMEOUT_MS = 20000;
 const LOCAL_ANNOUNCEMENT_MAX_CHARS = 260;
 const LOCAL_SPEECH_INPUT_GUARD_MS = 900;
 const LOCAL_SPEECH_OUTPUT_MUTE_BUFFER_MS = 800;
+const OUTPUT_AUDIO_ACTIVITY_THRESHOLD = 0.008;
+const OUTPUT_LEVEL_DECAY_MS = 220;
+const OUTPUT_SPEAKING_HOLD_MS = 1200;
+const OUTPUT_TRANSCRIPT_RESET_GAP_MS = 1400;
+const OUTPUT_TRANSCRIPT_MAX_LINES = 14;
+const ENABLE_LOCAL_SYSTEM_ANNOUNCEMENTS =
+  process.platform === 'darwin' &&
+  process.env['GEMINI_VOICE_LOCAL_TTS'] === '1';
 const execFileAsync = promisify(execFile);
 const MAX_LOCAL_QUERY_LIST_LIMIT = 200;
 const MAX_LOCAL_QUERY_FILE_LINES = 200;
@@ -168,6 +187,11 @@ const AFFIRMATIVE_TERMS = new Set([
   'allow',
   'run it',
   'do it',
+  'go on',
+  'carry on',
+  'continue',
+  'alow',
+  'allo',
 ]);
 const NEGATIVE_TERMS = new Set([
   'no',
@@ -217,6 +241,184 @@ const NEGATIVE_MARKERS = [
   "don't",
   'do not',
 ] as const;
+const NEGATIVE_FUZZY_MARKERS = ['cancel', 'deny', 'reject'] as const;
+const NON_DECISION_NOISE_TOKENS = new Set([
+  'noise',
+  'silence',
+  'background',
+  'static',
+  'inaudible',
+]);
+const NON_DECISION_LEADING_PREPOSITIONS = new Set([
+  'for',
+  'in',
+  'on',
+  'at',
+  'to',
+  'from',
+  'with',
+  'about',
+  'regarding',
+  'inside',
+  'within',
+]);
+const INTERPRET_PENDING_ACKS = [
+  "Got it. I'll interpret that and handle the pending choice.",
+  "Nice, understood. I'll sort out that pending action now.",
+  "Perfect, I heard you. I'll resolve that approval now.",
+] as const;
+const SUBMITTED_TO_AGENT_ACKS = [
+  'Done. I passed that to the coding agent.',
+  'All set. The coding agent has your request.',
+  "Done. I've handed that to the coding agent.",
+] as const;
+const SUBMITTED_GENERIC_ACKS = [
+  "Done. I've submitted your request.",
+  'All set. Your request is submitted.',
+  'Done. I sent that through.',
+] as const;
+const HINT_ADDED_ACKS = [
+  'Nice, I added that as a live hint.',
+  'Done. I passed that update to the running task.',
+  'Perfect, that guidance is now in the run.',
+] as const;
+
+function isTooShortDecisionTranscript(transcript: string): boolean {
+  const normalized = normalizeTranscriptText(transcript);
+  if (!normalized) {
+    return true;
+  }
+  if (/^\d+$/.test(normalized)) {
+    return false;
+  }
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (words.length === 0) {
+    return true;
+  }
+  if (words.length >= 2) {
+    return false;
+  }
+  return words[0].length < 2;
+}
+const DECISION_ORDINAL_TO_INDEX: Readonly<Record<string, number>> = {
+  first: 0,
+  second: 1,
+  third: 2,
+  fourth: 3,
+  fifth: 4,
+};
+const DECISION_PHRASE_HINTS: Readonly<Record<string, readonly string[]>> = {
+  allow_once: ['allow once', 'just once', 'only once', 'one time', 'this time'],
+  allow_session: [
+    'allow session',
+    'for this session',
+    'for the session',
+    'in this session',
+    'this session',
+    'current session',
+    'session only',
+    'session',
+  ],
+  allow_always: [
+    'allow always',
+    'always allow',
+    'allow permanently',
+    'every time',
+    'all the time',
+    'permanently',
+    'forever',
+  ],
+  allow_tool_session: [
+    'allow tool session',
+    'for this tool',
+    'this tool session',
+    'tool only',
+  ],
+  allow_server_session: [
+    'allow server session',
+    'for this server',
+    'this server session',
+    'server only',
+  ],
+  implement_auto_edit: [
+    'auto edit',
+    'automatic edit',
+    'apply edits',
+    'edit automatically',
+    'implement auto',
+  ],
+  implement_manual: [
+    'manual',
+    'manually',
+    'implement manually',
+    'manual edit',
+    'manual mode',
+    'do it manually',
+  ],
+  stay_in_plan: [
+    'stay in plan',
+    'stay in plan mode',
+    'keep plan',
+    'continue planning',
+    'do not implement',
+    'dont implement',
+  ],
+  keep: ['keep', 'keep enabled', 'leave enabled', 'do not disable'],
+  disable: ['disable', 'turn off', 'switch off'],
+  modify: ['modify', 'suggest changes', 'change it', 'edit command'],
+  cancel: ['cancel', 'stop', 'abort'],
+  deny: ['deny', 'reject', 'disallow'],
+};
+const DECISION_PRIORITY: readonly string[] = [
+  'allow_tool_session',
+  'allow_server_session',
+  'allow_session',
+  'allow_always',
+  'allow_once',
+  'implement_auto_edit',
+  'implement_manual',
+  'stay_in_plan',
+  'keep',
+  'disable',
+  'modify',
+  'answer',
+  'allow',
+  'deny',
+  'cancel',
+];
+
+function hasMarkerSequenceMatch(
+  normalizedText: string,
+  markers: readonly string[],
+): boolean {
+  const words = normalizedText.split(/\s+/).filter(Boolean);
+  if (words.length === 0) {
+    return false;
+  }
+
+  for (const marker of markers) {
+    const markerWords = marker.split(/\s+/).filter(Boolean);
+    if (markerWords.length === 0 || markerWords.length > words.length) {
+      continue;
+    }
+
+    const limit = words.length - markerWords.length;
+    for (let start = 0; start <= limit; start += 1) {
+      let matched = true;
+      for (let index = 0; index < markerWords.length; index += 1) {
+        if (words[start + index] !== markerWords[index]) {
+          matched = false;
+          break;
+        }
+      }
+      if (matched) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
 
 function toClampedNumber(
   value: number | undefined,
@@ -285,6 +487,48 @@ function resolveVoiceAssistantRuntimeConfig(
   };
 }
 
+function normalizePathTokenForSpeech(token: string): string {
+  const match = token.match(/^([("'`[]*)(.*?)([)"'`\],.;:!?]*)$/);
+  const leading = match?.[1] ?? '';
+  const core = match?.[2] ?? token;
+  const trailing = match?.[3] ?? '';
+
+  if (!core.includes('/') && !core.includes('\\')) {
+    return token;
+  }
+  if (!/[a-z]/i.test(core)) {
+    return token;
+  }
+
+  const segments = core.split(/[\\/]+/).filter(Boolean);
+  if (segments.length < 2) {
+    return token;
+  }
+
+  const spokenSegments = segments
+    .map((segment) =>
+      segment
+        .replace(/^[~.]+/, '')
+        .replace(/[._:-]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim(),
+    )
+    .filter(Boolean);
+  if (spokenSegments.length < 2) {
+    return token;
+  }
+
+  return `${leading}${spokenSegments.join(' ')}${trailing}`;
+}
+
+function normalizePathsForSpeech(text: string): string {
+  return text
+    .split(/\s+/)
+    .map((token) => normalizePathTokenForSpeech(token))
+    .join(' ')
+    .trim();
+}
+
 function sanitizeAnnouncementText(text: string) {
   const cleaned = text
     .replace(
@@ -296,14 +540,15 @@ function sanitizeAnnouncementText(text: string) {
     .replace(/^\s*[-*]\s+/gm, '')
     .replace(/\s+/g, ' ')
     .trim();
-  if (!cleaned) {
+  const speechSafe = normalizePathsForSpeech(cleaned);
+  if (!speechSafe) {
     return '';
   }
-  if (cleaned.length <= LOCAL_ANNOUNCEMENT_MAX_CHARS) {
-    return cleaned;
+  if (speechSafe.length <= LOCAL_ANNOUNCEMENT_MAX_CHARS) {
+    return speechSafe;
   }
 
-  const sentenceMatches = cleaned.match(/[^.!?]+[.!?]?/g) || [];
+  const sentenceMatches = speechSafe.match(/[^.!?]+[.!?]?/g) || [];
   let sentenceSummary = '';
   for (const sentence of sentenceMatches) {
     const candidate = `${sentenceSummary}${sentence}`.trim();
@@ -321,14 +566,14 @@ function sanitizeAnnouncementText(text: string) {
   }
 
   const hardLimit = LOCAL_ANNOUNCEMENT_MAX_CHARS - 1;
-  let clipped = cleaned.slice(0, hardLimit).trim();
+  let clipped = speechSafe.slice(0, hardLimit).trim();
   const lastSpace = clipped.lastIndexOf(' ');
   if (lastSpace >= 48) {
     clipped = clipped.slice(0, lastSpace).trim();
   }
   clipped = clipped.replace(/[,:;.-]+$/g, '').trim();
   if (!clipped) {
-    return cleaned.slice(0, LOCAL_ANNOUNCEMENT_MAX_CHARS);
+    return speechSafe.slice(0, LOCAL_ANNOUNCEMENT_MAX_CHARS);
   }
   return `${clipped}.`;
 }
@@ -337,17 +582,23 @@ const VOICE_ASSISTANT_SYSTEM_INSTRUCTION = `
 You are Gemini CLI Voice Assistant, a concise personal assistant controlling a coding agent.
 Hard rules:
 - Sound like a friendly, confident coding partner and keep replies concise.
-- Use natural conversational phrasing; avoid robotic status narration.
+- Use natural conversational phrasing with contractions and varied wording; avoid robotic status narration.
+- Keep the vibe human and lightly playful while staying professional and clear.
+- Avoid repeating the same acknowledgement opener across turns.
 - Respond in plain text using one to two short sentences unless you need one clarification question.
 - Never narrate internal reasoning, tool usage, or phrases like "initiating analysis".
 - Do not use markdown headings or status banners.
 - Do not dump long raw file-path lists; summarize counts and mention at most two examples.
+- If paths must be spoken, mention key path segments naturally and avoid reading slash characters one by one.
 - If the transcript sounds partial, wait for additional speech instead of immediately asking for restatement.
 - Never invent workspace facts, file names, git counts, paths, or command outputs.
 - Default to submit_user_request for user work requests so the coding agent does the real execution.
 - Use query_local_context only for lightweight read-only checks when delegation is unnecessary.
 - For status, approvals, permissions, or control, use tools instead of guessing.
 - For git status, changed files, or uncommitted file questions, delegate via submit_user_request.
+- Support speech in any language or dialect supported by the model, including European and Asian languages.
+- Translate user intent internally to clear English before delegating to coding tools.
+- If the meaning is ambiguous, ask one short clarification question before taking action.
 - Never auto-approve actions without an explicit user decision.
 - If the user says "stop" ambiguously, ask whether they mean stop listening, stop the active run, or both.
 - For mid-run changes while the agent is working, submit a steering hint so work continues.
@@ -560,14 +811,135 @@ function isLikelyFragment(text: string): boolean {
 
 function normalizeTranscriptText(text: string): string {
   return text
+    .normalize('NFKC')
     .toLowerCase()
-    .replace(/[^a-z0-9\s']/g, ' ')
+    .replace(/[^\p{L}\p{N}\s']/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
+function containsNonLatinLetters(text: string): boolean {
+  const normalized = text.normalize('NFKC');
+  for (const char of normalized) {
+    if (!/\p{L}/u.test(char)) {
+      continue;
+    }
+    if (!/\p{Script=Latin}/u.test(char)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function containsAnyKeyword(text: string, keywords: readonly string[]) {
   return keywords.some((keyword) => text.includes(keyword));
+}
+
+function getEditDistance(a: string, b: string): number {
+  if (a === b) {
+    return 0;
+  }
+  if (a.length === 0) {
+    return b.length;
+  }
+  if (b.length === 0) {
+    return a.length;
+  }
+
+  const prev = new Array<number>(b.length + 1);
+  const next = new Array<number>(b.length + 1);
+  for (let j = 0; j <= b.length; j += 1) {
+    prev[j] = j;
+  }
+
+  for (let i = 1; i <= a.length; i += 1) {
+    next[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const substitutionCost = a[i - 1] === b[j - 1] ? 0 : 1;
+      next[j] = Math.min(
+        prev[j] + 1,
+        next[j - 1] + 1,
+        prev[j - 1] + substitutionCost,
+      );
+    }
+    for (let j = 0; j <= b.length; j += 1) {
+      prev[j] = next[j];
+    }
+  }
+
+  return prev[b.length];
+}
+
+function hasFuzzyTokenMatch(
+  normalizedText: string,
+  markers: readonly string[],
+): boolean {
+  const tokens = normalizedText.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) {
+    return false;
+  }
+
+  for (const token of tokens) {
+    if (token.length < 2) {
+      continue;
+    }
+    for (const marker of markers) {
+      if (token === marker) {
+        return true;
+      }
+      const distance = getEditDistance(token, marker);
+      const maxDistance = marker.length <= 4 ? 1 : 2;
+      if (distance <= maxDistance) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+function computeAudioChunkLevel(chunk: Buffer): number {
+  const sampleCount = Math.floor(chunk.length / 2);
+  if (sampleCount <= 0) {
+    return 0;
+  }
+
+  // Sample every few frames for low overhead while preserving responsiveness.
+  const step = Math.max(1, Math.floor(sampleCount / 80));
+  let sumSquares = 0;
+  let measured = 0;
+  for (let index = 0; index < sampleCount; index += step) {
+    const pcm = chunk.readInt16LE(index * 2) / 32768;
+    sumSquares += pcm * pcm;
+    measured += 1;
+  }
+  if (measured === 0) {
+    return 0;
+  }
+
+  const rms = Math.sqrt(sumSquares / measured);
+  // Mild gain + clamp for a readable UI meter.
+  return Math.max(0, Math.min(1, rms * 9));
+}
+
+function hashSeedToIndex(seed: string, length: number): number {
+  if (length <= 0) {
+    return 0;
+  }
+  let hash = 0;
+  for (let i = 0; i < seed.length; i += 1) {
+    hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
+  }
+  return hash % length;
+}
+
+function pickVoicePhrase(options: readonly string[], seedText: string): string {
+  if (options.length === 0) {
+    return '';
+  }
+  const normalizedSeed = normalizeTranscriptText(seedText) || seedText.trim();
+  const index = hashSeedToIndex(normalizedSeed, options.length);
+  return options[index] || options[0];
 }
 
 function tokenizeForEcho(text: string): string[] {
@@ -676,6 +1048,44 @@ function mergeTranscriptChunk(base: string, chunk: string): string {
   return base + chunk;
 }
 
+function appendOutputTranscriptLine(
+  previousTranscript: string,
+  nextChunk: string,
+  startNewLine: boolean,
+): string {
+  const normalizedNextChunk = nextChunk.replace(/\s+/g, ' ').trim();
+  if (!normalizedNextChunk) {
+    return previousTranscript;
+  }
+
+  const lines = previousTranscript
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) {
+    return normalizedNextChunk;
+  }
+
+  if (startNewLine) {
+    const lastLine = lines[lines.length - 1] || '';
+    if (
+      normalizeTranscriptText(lastLine) !==
+      normalizeTranscriptText(normalizedNextChunk)
+    ) {
+      lines.push(normalizedNextChunk);
+    }
+    return lines.slice(-OUTPUT_TRANSCRIPT_MAX_LINES).join('\n');
+  }
+
+  const lastIndex = lines.length - 1;
+  const merged = mergeTranscriptChunk(lines[lastIndex], normalizedNextChunk)
+    .replace(/\s+/g, ' ')
+    .trim();
+  lines[lastIndex] = merged || normalizedNextChunk;
+  return lines.slice(-OUTPUT_TRANSCRIPT_MAX_LINES).join('\n');
+}
+
 function stripConversationalPrefix(text: string): string {
   const words = text.split(/\s+/).filter(Boolean);
   if (words.length === 0) {
@@ -698,6 +1108,11 @@ function isLikelyAssistantEcho(
   outputSegments: TimedTranscriptSegment[],
   now: number,
 ) {
+  // Never suppress explicit approval/deny intents as assistant echo.
+  if (detectSimpleDecision(inputText)) {
+    return false;
+  }
+
   const input = normalizeTranscriptText(inputText);
   if (input.length < 4) {
     return false;
@@ -791,19 +1206,57 @@ function detectSimpleDecision(text: string): 'approve' | 'reject' | null {
     return 'reject';
   }
 
-  const hasAffirmative = AFFIRMATIVE_MARKERS.some((marker) =>
-    normalized.includes(marker),
+  const hasAffirmative = hasMarkerSequenceMatch(
+    normalized,
+    AFFIRMATIVE_MARKERS,
   );
-  const hasNegative = NEGATIVE_MARKERS.some((marker) =>
-    normalized.includes(marker),
-  );
-  if (hasAffirmative && !hasNegative) {
+  const hasNegative = hasMarkerSequenceMatch(normalized, NEGATIVE_MARKERS);
+  const fuzzyAffirmative = hasFuzzyTokenMatch(normalized, AFFIRMATIVE_MARKERS);
+  const fuzzyNegative = hasFuzzyTokenMatch(normalized, NEGATIVE_FUZZY_MARKERS);
+  const isAffirmative = hasAffirmative || fuzzyAffirmative;
+  const isNegative = hasNegative || fuzzyNegative;
+  if (isAffirmative && !isNegative) {
     return 'approve';
   }
-  if (hasNegative && !hasAffirmative) {
+  if (isNegative && !isAffirmative) {
     return 'reject';
   }
   return null;
+}
+
+function isLikelyGenericConfirmationReply(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  // Keep questions out of the fast-path.
+  if (/[?؟]/u.test(trimmed)) {
+    return false;
+  }
+
+  const normalized = normalizeTranscriptText(trimmed);
+  if (!normalized) {
+    return false;
+  }
+
+  const words = normalized.split(/\s+/).filter(Boolean);
+  const decisionWords = words.filter(
+    (word) => !NON_DECISION_NOISE_TOKENS.has(word),
+  );
+  if (decisionWords.length === 0 || decisionWords.length > 3) {
+    return false;
+  }
+
+  const first = decisionWords[0];
+  if (QUESTION_LEADS.has(first) || COMMAND_LEADS.has(first)) {
+    return false;
+  }
+  if (NON_DECISION_LEADING_PREPOSITIONS.has(first)) {
+    return false;
+  }
+
+  return true;
 }
 
 function shouldAutoHandoffToCodingAgent(text: string): boolean {
@@ -899,6 +1352,118 @@ function pickDecisionForIntent(
     if (normalizedAllowed.includes(candidate)) {
       return candidate;
     }
+  }
+
+  return null;
+}
+
+function extractDecisionByOptionIndex(
+  normalizedTranscript: string,
+  allowedDecisions: string[],
+): string | null {
+  if (allowedDecisions.length === 0) {
+    return null;
+  }
+
+  const directNumberMatch = normalizedTranscript.match(/^\d+$/);
+  if (directNumberMatch) {
+    const index = Number.parseInt(directNumberMatch[0], 10) - 1;
+    if (index >= 0 && index < allowedDecisions.length) {
+      return allowedDecisions[index];
+    }
+  }
+
+  const numberedOptionMatch = normalizedTranscript.match(
+    /\b(?:option|choice|select|number|no)\s*(\d+)\b/,
+  );
+  if (numberedOptionMatch?.[1]) {
+    const index = Number.parseInt(numberedOptionMatch[1], 10) - 1;
+    if (index >= 0 && index < allowedDecisions.length) {
+      return allowedDecisions[index];
+    }
+  }
+
+  for (const [ordinal, index] of Object.entries(DECISION_ORDINAL_TO_INDEX)) {
+    if (
+      hasMarkerSequenceMatch(normalizedTranscript, [
+        `${ordinal} option`,
+        `option ${ordinal}`,
+        `${ordinal} choice`,
+      ]) ||
+      normalizedTranscript === ordinal
+    ) {
+      if (index >= 0 && index < allowedDecisions.length) {
+        return allowedDecisions[index];
+      }
+    }
+  }
+
+  if (
+    hasMarkerSequenceMatch(normalizedTranscript, ['last option']) ||
+    normalizedTranscript === 'last'
+  ) {
+    return allowedDecisions[allowedDecisions.length - 1];
+  }
+
+  return null;
+}
+
+function pickDecisionFromTranscript(
+  allowedDecisions: string[],
+  transcript: string,
+  fallbackApproveIfGenericReply = false,
+): string | null {
+  const normalizedTranscript = normalizeTranscriptText(transcript);
+  if (!normalizedTranscript) {
+    return null;
+  }
+
+  const normalizedAllowed = allowedDecisions.map((decision) =>
+    decision.toLowerCase(),
+  );
+  if (normalizedAllowed.length === 0) {
+    return null;
+  }
+
+  for (const decision of normalizedAllowed) {
+    const decisionPhrase = decision.replace(/_/g, ' ');
+    if (
+      normalizedTranscript === decision ||
+      normalizedTranscript === decisionPhrase ||
+      hasMarkerSequenceMatch(normalizedTranscript, [decisionPhrase])
+    ) {
+      return decision;
+    }
+  }
+
+  const optionIndexedDecision = extractDecisionByOptionIndex(
+    normalizedTranscript,
+    normalizedAllowed,
+  );
+  if (optionIndexedDecision) {
+    return optionIndexedDecision;
+  }
+
+  for (const decision of DECISION_PRIORITY) {
+    if (!normalizedAllowed.includes(decision)) {
+      continue;
+    }
+    const phrases = DECISION_PHRASE_HINTS[decision];
+    if (!phrases || phrases.length === 0) {
+      continue;
+    }
+    if (hasMarkerSequenceMatch(normalizedTranscript, phrases)) {
+      return decision;
+    }
+  }
+
+  const intent = detectSimpleDecision(transcript);
+  if (intent) {
+    return pickDecisionForIntent(normalizedAllowed, intent);
+  }
+
+  if (fallbackApproveIfGenericReply) {
+    return pickDecisionForIntent(normalizedAllowed, 'approve');
   }
 
   return null;
@@ -1189,6 +1754,7 @@ async function runLocalContextQuery(args: Record<string, unknown>) {
 export function useVoiceAssistantController({
   config,
   enabled,
+  captureAudio,
   runtimeConfig,
   isAgentBusy,
   onDisableRequested,
@@ -1226,20 +1792,33 @@ export function useVoiceAssistantController({
   const lastTranscriptFallbackAtRef = useRef(0);
   const lastLocalFallbackTranscriptRef = useRef('');
   const lastDirectDecisionKeyRef = useRef('');
+  const lastDirectDecisionAtRef = useRef(0);
   const lastAutoHandoffTranscriptRef = useRef('');
   const lastUserUtteranceRef = useRef('');
   const lastSubmittedRequestNormalizedRef = useRef('');
   const lastSubmittedRequestAtRef = useRef(0);
+  const lastApprovalPromptAtRef = useRef(0);
   const recentInputSegmentsRef = useRef<TimedTranscriptSegment[]>([]);
   const recentOutputSegmentsRef = useRef<TimedTranscriptSegment[]>([]);
   const muteModelOutputUntilRef = useRef(0);
   const localFallbackTimerRef = useRef<NodeJS.Timeout | null>(null);
   const autoHandoffTimerRef = useRef<NodeJS.Timeout | null>(null);
   const silenceHandoffTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const modelInterpretSubmitFallbackTimerRef = useRef<NodeJS.Timeout | null>(
+    null,
+  );
   const localSpeechQueueRef = useRef<Promise<void>>(Promise.resolve());
   const localSpeechActiveRef = useRef(false);
   const localSpeechInputGuardUntilRef = useRef(0);
+  const outputLevelRef = useRef(0);
+  const outputLevelDecayTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const outputSpeakingDecayTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const captureAudioRef = useRef(captureAudio);
+  const captureStopTimerRef = useRef<NodeJS.Timeout | null>(null);
   const [lastOutputAt, setLastOutputAt] = useState<number>(0);
+  const [sessionRestartNonce, setSessionRestartNonce] = useState(0);
+  const reconnectAttemptCountRef = useRef(0);
+  const lastReconnectAttemptAtRef = useRef(0);
 
   useEffect(() => {
     getRuntimeStatusRef.current = getRuntimeStatus;
@@ -1261,6 +1840,93 @@ export function useVoiceAssistantController({
     onDisableRequested,
   ]);
 
+  useEffect(() => {
+    if (captureAudio) {
+      if (captureStopTimerRef.current) {
+        clearTimeout(captureStopTimerRef.current);
+        captureStopTimerRef.current = null;
+      }
+      const wasCapturing = captureAudioRef.current;
+      captureAudioRef.current = true;
+      if (!wasCapturing) {
+        voiceDebugLog('audio.capture.started');
+      }
+      return;
+    }
+
+    if (!captureAudioRef.current || captureStopTimerRef.current) {
+      return;
+    }
+
+    voiceDebugLog('audio.capture.stop_queued', {
+      drainMs: PUSH_TO_TALK_RELEASE_DRAIN_MS,
+    });
+    captureStopTimerRef.current = setTimeout(() => {
+      captureStopTimerRef.current = null;
+      if (!captureAudioRef.current) {
+        return;
+      }
+      captureAudioRef.current = false;
+      voiceDebugLog('audio.capture.stopped');
+      if (sessionRef.current?.isConnected()) {
+        sessionRef.current.sendAudioStreamEnd('push_to_talk_release');
+      }
+    }, PUSH_TO_TALK_RELEASE_DRAIN_MS);
+    captureStopTimerRef.current.unref?.();
+  }, [captureAudio]);
+
+  useEffect(
+    () => () => {
+      if (captureStopTimerRef.current) {
+        clearTimeout(captureStopTimerRef.current);
+        captureStopTimerRef.current = null;
+      }
+      if (outputLevelDecayTimerRef.current) {
+        clearTimeout(outputLevelDecayTimerRef.current);
+        outputLevelDecayTimerRef.current = null;
+      }
+      if (outputSpeakingDecayTimerRef.current) {
+        clearTimeout(outputSpeakingDecayTimerRef.current);
+        outputSpeakingDecayTimerRef.current = null;
+      }
+      if (modelInterpretSubmitFallbackTimerRef.current) {
+        clearTimeout(modelInterpretSubmitFallbackTimerRef.current);
+        modelInterpretSubmitFallbackTimerRef.current = null;
+      }
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!enabled) {
+      if (captureStopTimerRef.current) {
+        clearTimeout(captureStopTimerRef.current);
+        captureStopTimerRef.current = null;
+      }
+      if (outputLevelDecayTimerRef.current) {
+        clearTimeout(outputLevelDecayTimerRef.current);
+        outputLevelDecayTimerRef.current = null;
+      }
+      if (outputSpeakingDecayTimerRef.current) {
+        clearTimeout(outputSpeakingDecayTimerRef.current);
+        outputSpeakingDecayTimerRef.current = null;
+      }
+      if (modelInterpretSubmitFallbackTimerRef.current) {
+        clearTimeout(modelInterpretSubmitFallbackTimerRef.current);
+        modelInterpretSubmitFallbackTimerRef.current = null;
+      }
+      captureAudioRef.current = false;
+      outputLevelRef.current = 0;
+      reconnectAttemptCountRef.current = 0;
+      lastReconnectAttemptAtRef.current = 0;
+      setState((prev) => ({
+        ...prev,
+        assistantSpeaking: false,
+        outputLevel: 0,
+      }));
+    }
+  }, [enabled]);
+
   const speak = useCallback((text: string) => {
     const prompt = sanitizeAnnouncementText(text);
     if (!prompt) {
@@ -1268,6 +1934,13 @@ export function useVoiceAssistantController({
     }
 
     const now = Date.now();
+    const promptNormalized = normalizeTranscriptText(prompt);
+    if (
+      promptNormalized.includes('approval required') ||
+      (promptNormalized.includes('allow') && promptNormalized.includes('deny'))
+    ) {
+      lastApprovalPromptAtRef.current = now;
+    }
     recentOutputSegmentsRef.current = pruneTranscriptSegments(
       recentOutputSegmentsRef.current,
       now,
@@ -1284,13 +1957,17 @@ export function useVoiceAssistantController({
       }
       muteModelOutputUntilRef.current = 0;
       sessionRef.current.sendTextTurn(
-        `Notification: ${prompt}\nReply in one short sentence.`,
+        `Notification: ${prompt}\nReply in one short, warm, conversational sentence with light personality. No emojis. If paths appear, speak key path segments naturally instead of slash-by-slash.`,
       );
       return true;
     };
 
-    if (process.platform !== 'darwin') {
+    if (!ENABLE_LOCAL_SYSTEM_ANNOUNCEMENTS) {
       return speakViaModel();
+    }
+
+    if (speakViaModel()) {
+      return true;
     }
 
     localSpeechQueueRef.current = localSpeechQueueRef.current.then(async () => {
@@ -1328,6 +2005,12 @@ export function useVoiceAssistantController({
         speakViaModel();
       } finally {
         localSpeechActiveRef.current = false;
+        outputLevelRef.current = 0;
+        setState((prev) => ({
+          ...prev,
+          assistantSpeaking: false,
+          outputLevel: 0,
+        }));
         muteModelOutputUntilRef.current = Math.max(
           muteModelOutputUntilRef.current,
           Date.now() + LOCAL_SPEECH_OUTPUT_MUTE_BUFFER_MS,
@@ -1355,8 +2038,23 @@ export function useVoiceAssistantController({
         clearTimeout(silenceHandoffTimerRef.current);
         silenceHandoffTimerRef.current = null;
       }
+      if (modelInterpretSubmitFallbackTimerRef.current) {
+        clearTimeout(modelInterpretSubmitFallbackTimerRef.current);
+        modelInterpretSubmitFallbackTimerRef.current = null;
+      }
+      if (outputLevelDecayTimerRef.current) {
+        clearTimeout(outputLevelDecayTimerRef.current);
+        outputLevelDecayTimerRef.current = null;
+      }
+      if (outputSpeakingDecayTimerRef.current) {
+        clearTimeout(outputSpeakingDecayTimerRef.current);
+        outputSpeakingDecayTimerRef.current = null;
+      }
       localSpeechActiveRef.current = false;
       localSpeechInputGuardUntilRef.current = 0;
+      outputLevelRef.current = 0;
+      reconnectAttemptCountRef.current = 0;
+      lastReconnectAttemptAtRef.current = 0;
       setState(INITIAL_STATE);
       return;
     }
@@ -1397,8 +2095,21 @@ export function useVoiceAssistantController({
       clearTimeout(silenceHandoffTimerRef.current);
       silenceHandoffTimerRef.current = null;
     }
+    if (modelInterpretSubmitFallbackTimerRef.current) {
+      clearTimeout(modelInterpretSubmitFallbackTimerRef.current);
+      modelInterpretSubmitFallbackTimerRef.current = null;
+    }
+    if (outputLevelDecayTimerRef.current) {
+      clearTimeout(outputLevelDecayTimerRef.current);
+      outputLevelDecayTimerRef.current = null;
+    }
+    if (outputSpeakingDecayTimerRef.current) {
+      clearTimeout(outputSpeakingDecayTimerRef.current);
+      outputSpeakingDecayTimerRef.current = null;
+    }
     localSpeechActiveRef.current = false;
     localSpeechInputGuardUntilRef.current = 0;
+    outputLevelRef.current = 0;
 
     setState((prev) => ({
       ...prev,
@@ -1414,10 +2125,45 @@ export function useVoiceAssistantController({
         return;
       }
       voiceDebugLog('controller.connection.open');
+      reconnectAttemptCountRef.current = 0;
       setState((prev) => ({
         ...prev,
         connectionState: 'connected',
       }));
+    };
+
+    const onClose = () => {
+      if (!active) {
+        return;
+      }
+      const now = Date.now();
+      if (
+        now - lastReconnectAttemptAtRef.current >
+        SESSION_RECONNECT_RESET_WINDOW_MS
+      ) {
+        reconnectAttemptCountRef.current = 0;
+      }
+      lastReconnectAttemptAtRef.current = now;
+      reconnectAttemptCountRef.current += 1;
+
+      const attempt = reconnectAttemptCountRef.current;
+      voiceDebugLog('controller.connection.closed', { attempt });
+      if (attempt > SESSION_MAX_RECONNECT_ATTEMPTS) {
+        setState((prev) => ({
+          ...prev,
+          connectionState: 'idle',
+          error:
+            'Voice session disconnected repeatedly. Hold Cmd+G to start a new session.',
+        }));
+        return;
+      }
+
+      setState((prev) => ({
+        ...prev,
+        connectionState: 'connecting',
+        error: null,
+      }));
+      setSessionRestartNonce((prev) => prev + 1);
     };
 
     const normalizeUserRequestForDedupe = (text: string) =>
@@ -1445,6 +2191,330 @@ export function useVoiceAssistantController({
       lastAutoHandoffTranscriptRef.current = text.trim();
     };
 
+    const announceOutput = (message: string, muteWindowMs = 0) => {
+      const trimmed = message.trim();
+      if (!trimmed) {
+        return;
+      }
+      const at = Date.now();
+      setLastOutputAt(at);
+      lastOutputAtRef.current = at;
+      // With push-to-talk, we only need an output mute window while actively
+      // capturing mic input. Otherwise this can hide the assistant's normal
+      // spoken acknowledgements.
+      if (muteWindowMs > 0 && captureAudioRef.current) {
+        muteModelOutputUntilRef.current = Math.max(
+          muteModelOutputUntilRef.current,
+          at + muteWindowMs,
+        );
+      }
+      setState((prev) => ({
+        ...prev,
+        outputTranscript: appendOutputTranscriptLine(
+          prev.outputTranscript,
+          trimmed,
+          true,
+        ),
+      }));
+      speak(trimmed);
+    };
+
+    const clearModelInterpretSubmitFallback = () => {
+      if (modelInterpretSubmitFallbackTimerRef.current) {
+        clearTimeout(modelInterpretSubmitFallbackTimerRef.current);
+        modelInterpretSubmitFallbackTimerRef.current = null;
+      }
+    };
+
+    const consumeInputTranscript = () => {
+      latestInputTranscriptRef.current = '';
+      setState((prev) =>
+        prev.inputTranscript
+          ? {
+              ...prev,
+              inputTranscript: '',
+            }
+          : prev,
+      );
+    };
+
+    const tryResolveDirectDecision = (transcript: string) => {
+      const pendingActions = getPendingActionsRef.current();
+      if (pendingActions.length === 0) {
+        return false;
+      }
+
+      const pending = pendingActions[0];
+      if (isTooShortDecisionTranscript(transcript)) {
+        return false;
+      }
+      const fallbackApproveIfGenericReply =
+        Date.now() - lastApprovalPromptAtRef.current <=
+          APPROVAL_REPLY_WINDOW_MS &&
+        isLikelyGenericConfirmationReply(transcript);
+      const mappedDecision = pickDecisionFromTranscript(
+        pending.allowedDecisions,
+        transcript,
+        fallbackApproveIfGenericReply,
+      );
+      if (!mappedDecision) {
+        return false;
+      }
+
+      const dedupeKey = `${pending.id}:${mappedDecision}:${normalizeTranscriptText(
+        transcript,
+      )}`;
+      if (lastDirectDecisionKeyRef.current === dedupeKey) {
+        return true;
+      }
+
+      lastDirectDecisionKeyRef.current = dedupeKey;
+      lastDirectDecisionAtRef.current = Date.now();
+      voiceDebugLog('controller.direct_decision.applied', {
+        transcript,
+        actionId: pending.id,
+        decision: mappedDecision,
+      });
+      void resolvePendingActionRef
+        .current({
+          actionId: pending.id,
+          decision: mappedDecision,
+        })
+        .then((message) => {
+          if (!active) {
+            return;
+          }
+          consumeInputTranscript();
+          announceOutput(message);
+        })
+        .catch((error) => {
+          lastDirectDecisionKeyRef.current = '';
+          voiceDebugLog('controller.direct_decision.failed', {
+            message: getErrorMessage(error),
+          });
+        });
+      return true;
+    };
+
+    const shouldRouteTranscriptViaModelInterpreter = (transcript: string) => {
+      const normalized = normalizeTranscriptText(transcript);
+      if (!normalized) {
+        return false;
+      }
+      if (detectSimpleDecision(normalized)) {
+        return false;
+      }
+      const words = normalized.split(/\s+/).filter(Boolean);
+      const hasPendingActions = getPendingActionsRef.current().length > 0;
+      const recentApprovalPrompt =
+        Date.now() - lastApprovalPromptAtRef.current <=
+        APPROVAL_REPLY_WINDOW_MS;
+      const likelyApprovalReply = isLikelyGenericConfirmationReply(transcript);
+
+      // Keep multilingual approval replies flowing even when the transcript is
+      // short (for example, single-word "allow" variants in non-Latin scripts).
+      if (
+        (hasPendingActions || recentApprovalPrompt) &&
+        (containsNonLatinLetters(transcript) || likelyApprovalReply)
+      ) {
+        return words.length >= 1;
+      }
+
+      if (!containsNonLatinLetters(transcript)) {
+        return false;
+      }
+      return words.length >= 2;
+    };
+
+    const routeTranscriptViaModelInterpreter = (
+      transcript: string,
+      source: 'auto_handoff' | 'local_fallback' | 'silence_handoff',
+    ) => {
+      const pendingActions = getPendingActionsRef
+        .current()
+        .slice(0, 3)
+        .map((action) => ({
+          id: action.id,
+          type: action.type,
+          title: action.title,
+          allowedDecisions: action.allowedDecisions,
+        }));
+      const hasPendingActions = pendingActions.length > 0;
+      const recentApprovalPrompt =
+        Date.now() - lastApprovalPromptAtRef.current <=
+        APPROVAL_REPLY_WINDOW_MS;
+      const likelyApprovalReply = isLikelyGenericConfirmationReply(transcript);
+      const requiresDecisionFlow =
+        hasPendingActions || recentApprovalPrompt || likelyApprovalReply;
+      const payload = JSON.stringify({
+        userSpeech: transcript,
+        source,
+        pendingActions,
+      });
+      voiceDebugLog(`${source}.model_interpret`, {
+        transcript,
+        hasPendingActions,
+        recentApprovalPrompt,
+        likelyApprovalReply,
+      });
+      if (requiresDecisionFlow) {
+        announceOutput(
+          pickVoicePhrase(INTERPRET_PENDING_ACKS, transcript),
+          POST_TOOL_MODEL_MUTE_MS,
+        );
+      }
+      const instructionLines = [
+        "Interpret the user's speech in any supported language or dialect and translate intent to clear English internally.",
+        hasPendingActions || recentApprovalPrompt || likelyApprovalReply
+          ? 'If this is an approval/denial for a pending action, call list_pending_actions if needed, then call resolve_pending_action.'
+          : 'If intent is clear, call submit_user_request (or submit_user_hint for in-flight steering).',
+        hasPendingActions || recentApprovalPrompt || likelyApprovalReply
+          ? 'When user says generic allow/yes without scope, choose the least permissive allow option available (for example allow_once).'
+          : 'Do not resolve pending actions unless the utterance is clearly a decision.',
+        hasPendingActions || recentApprovalPrompt || likelyApprovalReply
+          ? 'If the user specifies scope (session/always/tool/server), an explicit mode (manual/auto edit), or an option number, resolve to that exact allowed decision.'
+          : 'Respect explicit user choice if they mention a concrete decision option.',
+        'If this is clearly a new work request (not a decision), call submit_user_request or submit_user_hint.',
+        'If intent is ambiguous, ask exactly one short clarification question before taking action.',
+        `Payload: ${payload}`,
+      ];
+      session.sendTextTurn(instructionLines.join('\n'));
+      clearModelInterpretSubmitFallback();
+      const fallbackTranscript = transcript.trim();
+      modelInterpretSubmitFallbackTimerRef.current = setTimeout(() => {
+        if (!active) {
+          return;
+        }
+        if (requiresDecisionFlow) {
+          const pendingActions = getPendingActionsRef.current();
+          if (pendingActions.length === 0) {
+            return;
+          }
+          const pending = pendingActions[0];
+          const approvalWindowOpen =
+            Date.now() - lastApprovalPromptAtRef.current <=
+            APPROVAL_REPLY_WINDOW_MS;
+          const latestTranscript =
+            latestInputTranscriptRef.current.trim() || fallbackTranscript;
+          const modelOutputCandidate = buildCandidateUtterance(
+            recentOutputSegmentsRef.current,
+            OUTPUT_ECHO_WINDOW_MS,
+            Date.now(),
+          );
+          let mappedDecision = pickDecisionFromTranscript(
+            pending.allowedDecisions,
+            latestTranscript,
+            approvalWindowOpen &&
+              isLikelyGenericConfirmationReply(latestTranscript),
+          );
+          let mappedFrom: 'input' | 'assistant_output' = 'input';
+          if (!mappedDecision && modelOutputCandidate) {
+            mappedDecision = pickDecisionFromTranscript(
+              pending.allowedDecisions,
+              modelOutputCandidate,
+              approvalWindowOpen &&
+                isLikelyGenericConfirmationReply(modelOutputCandidate),
+            );
+            if (mappedDecision) {
+              mappedFrom = 'assistant_output';
+            }
+          }
+          if (!mappedDecision) {
+            voiceDebugLog(
+              `${source}.model_interpret_decision_fallback.unresolved`,
+              {
+                transcript: latestTranscript,
+                modelOutputCandidate,
+                actionId: pending.id,
+                allowedDecisions: pending.allowedDecisions,
+              },
+            );
+            return;
+          }
+
+          const dedupeText =
+            mappedFrom === 'assistant_output'
+              ? modelOutputCandidate || latestTranscript
+              : latestTranscript;
+          const dedupeKey = `${pending.id}:${mappedDecision}:${normalizeTranscriptText(
+            dedupeText,
+          )}`;
+          if (lastDirectDecisionKeyRef.current === dedupeKey) {
+            return;
+          }
+          lastDirectDecisionKeyRef.current = dedupeKey;
+          lastDirectDecisionAtRef.current = Date.now();
+          voiceDebugLog(`${source}.model_interpret_decision_fallback.applied`, {
+            transcript: latestTranscript,
+            modelOutputCandidate,
+            actionId: pending.id,
+            decision: mappedDecision,
+            mappedFrom,
+          });
+          void resolvePendingActionRef
+            .current({
+              actionId: pending.id,
+              decision: mappedDecision,
+            })
+            .then((message) => {
+              if (!active) {
+                return;
+              }
+              consumeInputTranscript();
+              announceOutput(message);
+            })
+            .catch((error) => {
+              lastDirectDecisionKeyRef.current = '';
+              voiceDebugLog(
+                `${source}.model_interpret_decision_fallback.failed`,
+                {
+                  message: getErrorMessage(error),
+                  actionId: pending.id,
+                  decision: mappedDecision,
+                },
+              );
+            });
+          return;
+        }
+
+        // Safety net: if model interpretation does not call a submission tool,
+        // hand off the request directly so voice input is never UI-only.
+        const handoffTranscript =
+          latestInputTranscriptRef.current.trim() || fallbackTranscript;
+        if (
+          !handoffTranscript ||
+          isLikelyFragment(handoffTranscript) ||
+          wasRecentlySubmitted(handoffTranscript)
+        ) {
+          return;
+        }
+        voiceDebugLog(`${source}.model_interpret_submit_fallback`, {
+          transcript: handoffTranscript,
+        });
+        lastAutoHandoffTranscriptRef.current = handoffTranscript;
+        lastToolCallAtRef.current = Date.now();
+        void submitUserRequestRef
+          .current(handoffTranscript)
+          .then((result) => {
+            if (!active) {
+              return;
+            }
+            markSubmittedRequest(handoffTranscript);
+            consumeInputTranscript();
+            const message =
+              (typeof result === 'string' && result.trim()) ||
+              pickVoicePhrase(SUBMITTED_TO_AGENT_ACKS, handoffTranscript);
+            announceOutput(message, POST_TOOL_MODEL_MUTE_MS);
+          })
+          .catch((error) => {
+            voiceDebugLog(`${source}.model_interpret_submit_fallback.failed`, {
+              message: getErrorMessage(error),
+            });
+          });
+      }, MODEL_INTERPRET_SUBMIT_FALLBACK_MS);
+      modelInterpretSubmitFallbackTimerRef.current.unref?.();
+    };
+
     const onInputTranscript = (text: string) => {
       if (!active || !text.trim()) {
         return;
@@ -1452,9 +2522,17 @@ export function useVoiceAssistantController({
       const now = Date.now();
       const trimmed = text.trim();
       if (
-        localSpeechActiveRef.current ||
-        now < localSpeechInputGuardUntilRef.current
+        !captureAudioRef.current &&
+        (localSpeechActiveRef.current ||
+          now < localSpeechInputGuardUntilRef.current)
       ) {
+        // During local announcements, still accept explicit approve/deny intents.
+        if (tryResolveDirectDecision(trimmed)) {
+          voiceDebugLog('input.blocked.local_announcement.decision_resolved', {
+            text: trimmed,
+          });
+          return;
+        }
         voiceDebugLog('input.blocked.local_announcement', {
           text: trimmed,
           localSpeechActive: localSpeechActiveRef.current,
@@ -1472,8 +2550,20 @@ export function useVoiceAssistantController({
         now,
         OUTPUT_ECHO_WINDOW_MS,
       );
+      const pendingActionsAtInput = getPendingActionsRef.current();
       if (
-        isLikelyAssistantEcho(trimmed, recentOutputSegmentsRef.current, now)
+        pendingActionsAtInput.length === 0 &&
+        now - lastDirectDecisionAtRef.current < DIRECT_DECISION_TAIL_IGNORE_MS
+      ) {
+        voiceDebugLog('input.ignored.post_decision_tail', {
+          text: trimmed,
+          msSinceDecision: now - lastDirectDecisionAtRef.current,
+        });
+        return;
+      }
+      if (
+        isLikelyAssistantEcho(trimmed, recentOutputSegmentsRef.current, now) &&
+        !(detectSimpleDecision(trimmed) && pendingActionsAtInput.length > 0)
       ) {
         voiceDebugLog('input.echo_ignored', {
           text: trimmed,
@@ -1508,50 +2598,8 @@ export function useVoiceAssistantController({
         inputTranscript: latestInputTranscriptRef.current,
       }));
 
-      const decisionIntent = detectSimpleDecision(
-        latestInputTranscriptRef.current,
-      );
-      if (decisionIntent) {
-        const pendingActions = getPendingActionsRef.current();
-        if (pendingActions.length > 0) {
-          const pending = pendingActions[0];
-          const mappedDecision = pickDecisionForIntent(
-            pending.allowedDecisions,
-            decisionIntent,
-          );
-          if (mappedDecision) {
-            const dedupeKey = `${pending.id}:${mappedDecision}:${normalizeTranscriptText(
-              latestInputTranscriptRef.current,
-            )}`;
-            if (lastDirectDecisionKeyRef.current !== dedupeKey) {
-              lastDirectDecisionKeyRef.current = dedupeKey;
-              void resolvePendingActionRef
-                .current({
-                  actionId: pending.id,
-                  decision: mappedDecision,
-                })
-                .then((message) => {
-                  if (!active) {
-                    return;
-                  }
-                  const at = Date.now();
-                  setLastOutputAt(at);
-                  lastOutputAtRef.current = at;
-                  setState((prev) => ({
-                    ...prev,
-                    outputTranscript: message,
-                  }));
-                  speak(message);
-                })
-                .catch((error) => {
-                  voiceDebugLog('controller.direct_decision.failed', {
-                    message: getErrorMessage(error),
-                  });
-                });
-            }
-            return;
-          }
-        }
+      if (tryResolveDirectDecision(latestInputTranscriptRef.current)) {
+        return;
       }
 
       if (autoHandoffTimerRef.current) {
@@ -1567,6 +2615,18 @@ export function useVoiceAssistantController({
         }
 
         const transcript = latestInputTranscriptRef.current.trim();
+        if (shouldRouteTranscriptViaModelInterpreter(transcript)) {
+          if (transcript === lastAutoHandoffTranscriptRef.current) {
+            return;
+          }
+          if (wasRecentlySubmitted(transcript)) {
+            return;
+          }
+          lastAutoHandoffTranscriptRef.current = transcript;
+          lastToolCallAtRef.current = Date.now();
+          routeTranscriptViaModelInterpreter(transcript, 'auto_handoff');
+          return;
+        }
         if (!shouldAutoHandoffToCodingAgent(transcript)) {
           return;
         }
@@ -1598,16 +2658,11 @@ export function useVoiceAssistantController({
               return;
             }
             markSubmittedRequest(transcript);
+            consumeInputTranscript();
             const message =
               (typeof result === 'string' && result.trim()) ||
-              'Submitted your request to the coding agent.';
-            const at = Date.now();
-            setLastOutputAt(at);
-            lastOutputAtRef.current = at;
-            setState((prev) => ({
-              ...prev,
-              outputTranscript: message,
-            }));
+              pickVoicePhrase(SUBMITTED_TO_AGENT_ACKS, transcript);
+            announceOutput(message, POST_TOOL_MODEL_MUTE_MS);
           })
           .catch((error) => {
             voiceDebugLog('auto_handoff.submit_request.failed', {
@@ -1629,6 +2684,19 @@ export function useVoiceAssistantController({
         }
         const transcript = latestInputTranscriptRef.current.trim();
         if (!transcript) {
+          return;
+        }
+
+        if (shouldRouteTranscriptViaModelInterpreter(transcript)) {
+          if (transcript === lastLocalFallbackTranscriptRef.current) {
+            return;
+          }
+          if (wasRecentlySubmitted(transcript)) {
+            return;
+          }
+          lastLocalFallbackTranscriptRef.current = transcript;
+          lastToolCallAtRef.current = Date.now();
+          routeTranscriptViaModelInterpreter(transcript, 'local_fallback');
           return;
         }
 
@@ -1662,16 +2730,11 @@ export function useVoiceAssistantController({
               return;
             }
             markSubmittedRequest(transcript);
+            consumeInputTranscript();
             const message =
               (typeof result === 'string' && result.trim()) ||
-              'Submitted your request.';
-            const at = Date.now();
-            setLastOutputAt(at);
-            lastOutputAtRef.current = at;
-            setState((prev) => ({
-              ...prev,
-              outputTranscript: message,
-            }));
+              pickVoicePhrase(SUBMITTED_GENERIC_ACKS, transcript);
+            announceOutput(message, POST_TOOL_MODEL_MUTE_MS);
           })
           .catch((error) => {
             voiceDebugLog('local_fallback.submit_request.failed', {
@@ -1712,7 +2775,9 @@ export function useVoiceAssistantController({
         isLikelyMetaNarration(text) ||
         isLikelyMetaNarration(candidateOutput)
       ) {
-        muteModelOutputUntilRef.current = now + POST_TOOL_MODEL_MUTE_MS;
+        if (captureAudioRef.current) {
+          muteModelOutputUntilRef.current = now + POST_TOOL_MODEL_MUTE_MS;
+        }
         recentOutputSegmentsRef.current = prunedOutputs;
         voiceDebugLog('output.meta_suppressed', {
           text: candidateOutput || text,
@@ -1720,11 +2785,16 @@ export function useVoiceAssistantController({
         return;
       }
       recentOutputSegmentsRef.current = candidateOutputs;
+      const previousOutputAt = lastOutputAtRef.current;
       setLastOutputAt(now);
       lastOutputAtRef.current = now;
       setState((prev) => ({
         ...prev,
-        outputTranscript: text,
+        outputTranscript: appendOutputTranscriptLine(
+          prev.outputTranscript,
+          text,
+          now - previousOutputAt > OUTPUT_TRANSCRIPT_RESET_GAP_MS,
+        ),
       }));
     };
 
@@ -1741,6 +2811,52 @@ export function useVoiceAssistantController({
         return;
       }
       playback.playChunk(chunk);
+
+      // Keep assistant speaking state alive while audio chunks are arriving,
+      // even when a given chunk has very low energy.
+      if (outputSpeakingDecayTimerRef.current) {
+        clearTimeout(outputSpeakingDecayTimerRef.current);
+      }
+      outputSpeakingDecayTimerRef.current = setTimeout(() => {
+        setState((prev) => ({
+          ...prev,
+          assistantSpeaking: false,
+          outputLevel: 0,
+        }));
+      }, OUTPUT_SPEAKING_HOLD_MS);
+      outputSpeakingDecayTimerRef.current.unref?.();
+
+      const chunkLevel = computeAudioChunkLevel(chunk);
+      setState((prev) =>
+        prev.assistantSpeaking
+          ? prev
+          : {
+              ...prev,
+              assistantSpeaking: true,
+            },
+      );
+      if (chunkLevel < OUTPUT_AUDIO_ACTIVITY_THRESHOLD) {
+        return;
+      }
+      const smoothedLevel = outputLevelRef.current * 0.2 + chunkLevel * 0.8;
+      outputLevelRef.current = smoothedLevel;
+      setState((prev) => ({
+        ...prev,
+        assistantSpeaking: true,
+        outputLevel: smoothedLevel,
+      }));
+
+      if (outputLevelDecayTimerRef.current) {
+        clearTimeout(outputLevelDecayTimerRef.current);
+      }
+      outputLevelDecayTimerRef.current = setTimeout(() => {
+        outputLevelRef.current = 0;
+        setState((prev) => ({
+          ...prev,
+          outputLevel: 0,
+        }));
+      }, OUTPUT_LEVEL_DECAY_MS);
+      outputLevelDecayTimerRef.current.unref?.();
     };
 
     const onError = (error: Error) => {
@@ -1759,9 +2875,9 @@ export function useVoiceAssistantController({
 
     const onToolCall = (functionCalls: FunctionCall[]) => {
       lastToolCallAtRef.current = Date.now();
+      clearModelInterpretSubmitFallback();
       void (async () => {
         const responses: FunctionResponse[] = [];
-        let muteModelFollowup = false;
         voiceDebugLog('controller.tool_call.received', {
           count: functionCalls.length,
           names: functionCalls.map((call) => call.name || 'unknown'),
@@ -1793,7 +2909,6 @@ export function useVoiceAssistantController({
                     'I already submitted that request to the coding agent.',
                 },
               });
-              muteModelFollowup = true;
               continue;
             }
           }
@@ -1834,7 +2949,6 @@ export function useVoiceAssistantController({
               (response.name === 'query_local_context' &&
                 responseBody['delegated'] === true))
           ) {
-            muteModelFollowup = true;
             const submittedText = asStringArg(responseBody['submittedText']);
             if (
               (response.name === 'submit_user_request' ||
@@ -1843,18 +2957,9 @@ export function useVoiceAssistantController({
             ) {
               markSubmittedRequest(submittedText);
             }
-            const at = Date.now();
-            setLastOutputAt(at);
-            lastOutputAtRef.current = at;
-            setState((prev) => ({
-              ...prev,
-              outputTranscript: responseMessage,
-            }));
+            consumeInputTranscript();
+            announceOutput(responseMessage, POST_TOOL_MODEL_MUTE_MS);
           }
-        }
-        if (muteModelFollowup) {
-          muteModelOutputUntilRef.current =
-            Date.now() + POST_TOOL_MODEL_MUTE_MS;
         }
         if (responses.length > 0) {
           session.sendToolResponses(responses);
@@ -1870,6 +2975,7 @@ export function useVoiceAssistantController({
     };
 
     session.on('open', onOpen);
+    session.on('close', onClose);
     session.on('inputTranscript', onInputTranscript);
     session.on('outputTranscript', onOutputTranscript);
     session.on('outputAudioChunk', onOutputAudioChunk);
@@ -1877,13 +2983,10 @@ export function useVoiceAssistantController({
     session.on('error', onError);
 
     const unsubscribePcm = audioEngine.subscribePcm((pcmBytes) => {
-      const now = Date.now();
-      if (
-        localSpeechActiveRef.current ||
-        now < localSpeechInputGuardUntilRef.current
-      ) {
+      if (!captureAudioRef.current) {
         return;
       }
+      // While push-to-talk is actively held, forward audio even during local narration.
       session.sendAudioChunk(pcmBytes);
     });
 
@@ -1913,6 +3016,18 @@ export function useVoiceAssistantController({
 
     const unsubscribeAudioState = audioEngine.subscribe((audioState) => {
       if (!resolvedRuntimeConfig.forceTurnEndOnSilence) {
+        return;
+      }
+      if (!captureAudioRef.current) {
+        if (wasTalkingRef.current) {
+          wasTalkingRef.current = false;
+          speechStartAtRef.current = 0;
+          lastTalkingAtRef.current = 0;
+        }
+        if (silenceHandoffTimerRef.current) {
+          clearTimeout(silenceHandoffTimerRef.current);
+          silenceHandoffTimerRef.current = null;
+        }
         return;
       }
 
@@ -1979,6 +3094,19 @@ export function useVoiceAssistantController({
             return;
           }
           const transcript = latestInputTranscriptRef.current.trim();
+          const currentNow = Date.now();
+          if (shouldRouteTranscriptViaModelInterpreter(transcript)) {
+            if (transcript === lastAutoHandoffTranscriptRef.current) {
+              return;
+            }
+            if (wasRecentlySubmitted(transcript)) {
+              return;
+            }
+            lastAutoHandoffTranscriptRef.current = transcript;
+            lastToolCallAtRef.current = currentNow;
+            routeTranscriptViaModelInterpreter(transcript, 'silence_handoff');
+            return;
+          }
           if (!shouldAutoHandoffToCodingAgent(transcript)) {
             return;
           }
@@ -1989,7 +3117,6 @@ export function useVoiceAssistantController({
             return;
           }
 
-          const currentNow = Date.now();
           const sinceLastToolCall = currentNow - lastToolCallAtRef.current;
           const sinceLastOutput = currentNow - lastOutputAtRef.current;
           const sinceLastInput = currentNow - lastInputAtRef.current;
@@ -2019,17 +3146,11 @@ export function useVoiceAssistantController({
                 return;
               }
               markSubmittedRequest(transcript);
+              consumeInputTranscript();
               const message =
                 (typeof result === 'string' && result.trim()) ||
-                'Submitted your request to the coding agent.';
-              const at = Date.now();
-              setLastOutputAt(at);
-              lastOutputAtRef.current = at;
-              muteModelOutputUntilRef.current = at + POST_TOOL_MODEL_MUTE_MS;
-              setState((prev) => ({
-                ...prev,
-                outputTranscript: message,
-              }));
+                pickVoicePhrase(SUBMITTED_TO_AGENT_ACKS, transcript);
+              announceOutput(message, POST_TOOL_MODEL_MUTE_MS);
             })
             .catch((error) => {
               voiceDebugLog('silence_handoff.submit_request.failed', {
@@ -2104,11 +3225,25 @@ export function useVoiceAssistantController({
         clearTimeout(silenceHandoffTimerRef.current);
         silenceHandoffTimerRef.current = null;
       }
+      if (modelInterpretSubmitFallbackTimerRef.current) {
+        clearTimeout(modelInterpretSubmitFallbackTimerRef.current);
+        modelInterpretSubmitFallbackTimerRef.current = null;
+      }
+      if (outputLevelDecayTimerRef.current) {
+        clearTimeout(outputLevelDecayTimerRef.current);
+        outputLevelDecayTimerRef.current = null;
+      }
+      if (outputSpeakingDecayTimerRef.current) {
+        clearTimeout(outputSpeakingDecayTimerRef.current);
+        outputSpeakingDecayTimerRef.current = null;
+      }
       localSpeechActiveRef.current = false;
       localSpeechInputGuardUntilRef.current = 0;
+      outputLevelRef.current = 0;
       unsubscribePcm();
       unsubscribeAudioState();
       session.off('open', onOpen);
+      session.off('close', onClose);
       session.off('inputTranscript', onInputTranscript);
       session.off('outputTranscript', onOutputTranscript);
       session.off('outputAudioChunk', onOutputAudioChunk);
@@ -2119,7 +3254,7 @@ export function useVoiceAssistantController({
       sessionRef.current = null;
       playbackRef.current = null;
     };
-  }, [config, enabled, resolvedRuntimeConfig, speak]);
+  }, [config, enabled, resolvedRuntimeConfig, sessionRestartNonce, speak]);
 
   return {
     ...state,
@@ -2188,7 +3323,8 @@ async function handleAssistantToolCall(
               delegated: true,
               submittedText: delegatedText,
               message:
-                submitResult || 'Submitted your request to the coding agent.',
+                submitResult ||
+                pickVoicePhrase(SUBMITTED_TO_AGENT_ACKS, delegatedText),
             },
           };
         }
@@ -2206,7 +3342,8 @@ async function handleAssistantToolCall(
               delegated: true,
               submittedText: fallbackRequestText,
               message:
-                submitResult || 'Submitted your request to the coding agent.',
+                submitResult ||
+                pickVoicePhrase(SUBMITTED_TO_AGENT_ACKS, fallbackRequestText),
             },
           };
         }
@@ -2252,7 +3389,7 @@ async function handleAssistantToolCall(
           response: {
             ok: true,
             submittedText: text,
-            message: result || 'Submitted the request to the coding agent.',
+            message: result || pickVoicePhrase(SUBMITTED_TO_AGENT_ACKS, text),
           },
         };
       }
@@ -2271,7 +3408,7 @@ async function handleAssistantToolCall(
           name,
           response: {
             ok: true,
-            message: result || 'Added your update as a live hint.',
+            message: result || pickVoicePhrase(HINT_ADDED_ACKS, text),
           },
         };
       }
@@ -2291,20 +3428,17 @@ async function handleAssistantToolCall(
           : pendingActions[0];
         let decision = rawDecision.toLowerCase();
         if (targetAction && !targetAction.allowedDecisions.includes(decision)) {
-          const intent = detectSimpleDecision(rawDecision);
-          if (intent) {
-            const mapped = pickDecisionForIntent(
-              targetAction.allowedDecisions,
-              intent,
-            );
-            if (mapped) {
-              voiceDebugLog('tool.resolve_pending_action.decision_mapped', {
-                original: rawDecision,
-                mapped,
-                actionId: targetAction.id,
-              });
-              decision = mapped;
-            }
+          const mapped = pickDecisionFromTranscript(
+            targetAction.allowedDecisions,
+            rawDecision,
+          );
+          if (mapped) {
+            voiceDebugLog('tool.resolve_pending_action.decision_mapped', {
+              original: rawDecision,
+              mapped,
+              actionId: targetAction.id,
+            });
+            decision = mapped;
           }
         }
         const request: ResolvePendingActionRequest = {

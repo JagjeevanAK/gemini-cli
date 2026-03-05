@@ -207,38 +207,6 @@ function isToolAwaitingConfirmation(
     );
 }
 
-const VOICE_AGENT_HANDOFF_PROTOCOL = 'voice-agent-handoff/v1';
-
-function buildVoiceAgentHandoffMessage({
-  kind,
-  utterance,
-  streamingState,
-  pendingActionCount,
-}: {
-  kind: 'request' | 'hint';
-  utterance: string;
-  streamingState: StreamingState;
-  pendingActionCount: number;
-}) {
-  const payload = {
-    protocol: VOICE_AGENT_HANDOFF_PROTOCOL,
-    kind,
-    source: 'voice_assistant',
-    timestamp: new Date().toISOString(),
-    streamingState,
-    pendingActionCount,
-    utterance,
-  };
-
-  return [
-    '[VOICE_AGENT_HANDOFF_V1]',
-    JSON.stringify(payload),
-    '[/VOICE_AGENT_HANDOFF_V1]',
-    '',
-    utterance,
-  ].join('\n');
-}
-
 function sanitizeVoiceAnnouncementText(text: string) {
   return text
     .replace(
@@ -258,10 +226,6 @@ function shortenVoiceSnippet(text: string, maxChars: number) {
     return trimmed;
   }
   return `${trimmed.slice(0, maxChars - 3)}...`;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function extractUniqueFilePaths(text: string): string[] {
@@ -357,41 +321,6 @@ function getLatestCompletedToolSummary(history: HistoryItem[]): string | null {
   return null;
 }
 
-function getLatestVoiceRequestContext(history: HistoryItem[]): string | null {
-  for (let index = history.length - 1; index >= 0; index -= 1) {
-    const item = history[index];
-    if (item.type !== 'user' || typeof item.text !== 'string') {
-      continue;
-    }
-
-    const match = item.text.match(
-      /\[VOICE_AGENT_HANDOFF_V1\]\s*([\s\S]*?)\s*\[\/VOICE_AGENT_HANDOFF_V1\]/,
-    );
-    if (!match?.[1]) {
-      continue;
-    }
-
-    try {
-      const parsed: unknown = JSON.parse(match[1]);
-      if (!isRecord(parsed)) {
-        continue;
-      }
-      const payload = parsed;
-      if (
-        payload['kind'] === 'request' &&
-        typeof payload['utterance'] === 'string' &&
-        payload['utterance'].trim().length > 0
-      ) {
-        return shortenVoiceSnippet(payload['utterance'].trim(), 90);
-      }
-    } catch {
-      // Ignore malformed handoff payloads.
-    }
-  }
-
-  return null;
-}
-
 function getLatestAssistantTurnText(history: HistoryItem[]): string | null {
   const collected: string[] = [];
 
@@ -415,6 +344,43 @@ function getLatestAssistantTurnText(history: HistoryItem[]): string | null {
   }
 
   return collected.reverse().join(' ').replace(/\s+/g, ' ').trim();
+}
+
+function isQuotaOrRateLimitErrorText(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return (
+    normalized.includes('quota') ||
+    normalized.includes('rate limit') ||
+    normalized.includes('generate_content_free_tier_requests') ||
+    normalized.includes('code: 429') ||
+    normalized.includes(' 429')
+  );
+}
+
+function extractRetryDelaySeconds(text: string): number | null {
+  const retryMatch = text.match(/retry in\s+([0-9]+(?:\.[0-9]+)?)s/i);
+  if (!retryMatch?.[1]) {
+    return null;
+  }
+  const parsed = Number.parseFloat(retryMatch[1]);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+}
+
+function extractApiErrorMessage(text: string): string | null {
+  const bracketedApiErrorMatch = text.match(/\[API Error:\s*([^\]]+)\]/i);
+  if (bracketedApiErrorMatch?.[1]) {
+    return bracketedApiErrorMatch[1].trim();
+  }
+
+  const inlineApiErrorMatch = text.match(/api error:\s*(.+)$/i);
+  if (inlineApiErrorMatch?.[1]) {
+    return inlineApiErrorMatch[1].trim();
+  }
+
+  return null;
 }
 
 interface AppContainerProps {
@@ -2357,6 +2323,7 @@ Logging in with Google... Restarting Gemini CLI to continue.
   );
 
   const [voiceAssistantEnabled, setVoiceAssistantEnabled] = useState(false);
+  const [voiceAssistantListening, setVoiceAssistantListening] = useState(false);
   const voiceAssistantRuntimeConfig = useMemo<VoiceAssistantRuntimeConfig>(
     () => ({
       model: settings.merged.ui.voiceAssistant.model,
@@ -2406,13 +2373,37 @@ Logging in with Google... Restarting Gemini CLI to continue.
     });
   }, [voiceAssistantEnabled]);
 
+  useEffect(() => {
+    voiceDebugLog('app.voice_listening.changed', {
+      listening: voiceAssistantListening,
+    });
+  }, [voiceAssistantListening]);
+
   const toggleVoiceAssistant = useCallback(() => {
     setVoiceAssistantEnabled((prev) => !prev);
   }, []);
 
+  const enableVoiceAssistant = useCallback(() => {
+    setVoiceAssistantEnabled(true);
+  }, []);
+
   const disableVoiceAssistant = useCallback(() => {
+    setVoiceAssistantListening(false);
     setVoiceAssistantEnabled(false);
   }, []);
+
+  const setVoiceAssistantListeningState = useCallback((listening: boolean) => {
+    setVoiceAssistantListening(listening);
+    if (listening) {
+      setVoiceAssistantEnabled(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!voiceAssistantEnabled) {
+      setVoiceAssistantListening(false);
+    }
+  }, [voiceAssistantEnabled]);
 
   const getPendingVoiceActions = useCallback(
     () =>
@@ -2474,13 +2465,6 @@ Logging in with Google... Restarting Gemini CLI to continue.
       if (!trimmed) {
         return 'I did not catch that update clearly. Can you repeat it?';
       }
-      const handoffHint = buildVoiceAgentHandoffMessage({
-        kind: 'hint',
-        utterance: trimmed,
-        streamingState,
-        pendingActionCount: getPendingVoiceActions().length,
-      });
-
       (
         config.userHintService as {
           addUserHint: (
@@ -2488,14 +2472,14 @@ Logging in with Google... Restarting Gemini CLI to continue.
             options?: { force?: boolean },
           ) => void;
         }
-      ).addUserHint(handoffHint, { force: true });
+      ).addUserHint(trimmed, { force: true });
       historyManager.addItem({
         type: 'hint',
         text: trimmed,
       });
       return 'Got it. I shared that with the running agent.';
     },
-    [config, getPendingVoiceActions, historyManager, streamingState],
+    [config, historyManager],
   );
 
   const submitVoiceUserRequest = useCallback(
@@ -2514,22 +2498,12 @@ Logging in with Google... Restarting Gemini CLI to continue.
         return 'Perfect. I added that while the current run keeps going.';
       }
 
-      const handoffRequest = buildVoiceAgentHandoffMessage({
-        kind: 'request',
-        utterance: trimmed,
-        streamingState,
-        pendingActionCount: getPendingVoiceActions().length,
-      });
-      await handleFinalSubmit(handoffRequest);
+      // Submit the spoken request through the same path as keyboard + Enter
+      // so UI/input behavior stays identical.
+      await handleFinalSubmit(trimmed);
       return "On it. I'll check that and report back.";
     },
-    [
-      streamingState,
-      pendingHistoryItems,
-      getPendingVoiceActions,
-      submitVoiceHint,
-      handleFinalSubmit,
-    ],
+    [streamingState, pendingHistoryItems, submitVoiceHint, handleFinalSubmit],
   );
 
   const resolveVoicePendingAction = useCallback(
@@ -2717,6 +2691,7 @@ Logging in with Google... Restarting Gemini CLI to continue.
   const voiceAssistantController = useVoiceAssistantController({
     config,
     enabled: voiceAssistantEnabled,
+    captureAudio: voiceAssistantListening,
     runtimeConfig: voiceAssistantRuntimeConfig,
     isAgentBusy: isVoiceAgentBusy,
     onDisableRequested: disableVoiceAssistant,
@@ -2762,10 +2737,6 @@ Logging in with Google... Restarting Gemini CLI to continue.
     () => getLatestCompletedToolSummary(historyManager.history),
     [historyManager.history],
   );
-  const latestVoiceRequestContext = useMemo(
-    () => getLatestVoiceRequestContext(historyManager.history),
-    [historyManager.history],
-  );
 
   const latestVoiceCompletionSummaryRef = useRef<string | null>(
     latestVoiceCompletionSummary,
@@ -2773,18 +2744,10 @@ Logging in with Google... Restarting Gemini CLI to continue.
   const latestVoiceToolSummaryRef = useRef<string | null>(
     latestVoiceToolSummary,
   );
-  const latestVoiceRequestContextRef = useRef<string | null>(
-    latestVoiceRequestContext,
-  );
   useEffect(() => {
     latestVoiceCompletionSummaryRef.current = latestVoiceCompletionSummary;
     latestVoiceToolSummaryRef.current = latestVoiceToolSummary;
-    latestVoiceRequestContextRef.current = latestVoiceRequestContext;
-  }, [
-    latestVoiceCompletionSummary,
-    latestVoiceToolSummary,
-    latestVoiceRequestContext,
-  ]);
+  }, [latestVoiceCompletionSummary, latestVoiceToolSummary]);
 
   const lastVoiceAttentionKeyRef = useRef<string | null>(null);
   useEffect(() => {
@@ -2820,6 +2783,64 @@ Logging in with Google... Restarting Gemini CLI to continue.
     voiceAssistantAttentionNotification,
   ]);
 
+  const lastVoiceErrorAnnouncementRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!voiceAssistantEnabled || voiceConnectionState !== 'connected') {
+      return;
+    }
+
+    let latestErrorText: string | null = null;
+    for (
+      let index = historyManager.history.length - 1;
+      index >= 0;
+      index -= 1
+    ) {
+      const item = historyManager.history[index];
+      if (item.type === MessageType.ERROR) {
+        latestErrorText = item.text;
+        break;
+      }
+    }
+    if (!latestErrorText) {
+      return;
+    }
+
+    if (lastVoiceErrorAnnouncementRef.current === latestErrorText) {
+      return;
+    }
+    lastVoiceErrorAnnouncementRef.current = latestErrorText;
+
+    const apiErrorMessage = extractApiErrorMessage(latestErrorText);
+    if (apiErrorMessage) {
+      if (isQuotaOrRateLimitErrorText(latestErrorText)) {
+        const retryDelaySeconds = extractRetryDelaySeconds(latestErrorText);
+        const retryHint = retryDelaySeconds
+          ? ` Please retry in about ${Math.max(1, Math.ceil(retryDelaySeconds))} seconds.`
+          : ' Please wait a bit and try again.';
+        speakVoiceAnnouncement(`API error. ${apiErrorMessage}.${retryHint}`);
+        return;
+      }
+
+      speakVoiceAnnouncement(`API error. ${apiErrorMessage}.`);
+      return;
+    }
+
+    if (isQuotaOrRateLimitErrorText(latestErrorText)) {
+      const retryDelaySeconds = extractRetryDelaySeconds(latestErrorText);
+      const retryHint = retryDelaySeconds
+        ? ` Please retry in about ${Math.max(1, Math.ceil(retryDelaySeconds))} seconds.`
+        : ' Please wait a bit and try again.';
+      speakVoiceAnnouncement(
+        `I hit API quota limits for the coding model.${retryHint}`,
+      );
+    }
+  }, [
+    historyManager.history,
+    voiceAssistantEnabled,
+    voiceConnectionState,
+    speakVoiceAnnouncement,
+  ]);
+
   const previousStreamingStateForVoiceRef = useRef(streamingState);
   const completionAnnouncementTimerRef = useRef<NodeJS.Timeout | null>(null);
   useEffect(
@@ -2846,7 +2867,11 @@ Logging in with Google... Restarting Gemini CLI to continue.
         clearTimeout(completionAnnouncementTimerRef.current);
         completionAnnouncementTimerRef.current = null;
       }
-      speakVoiceAnnouncement('Started working on your request.');
+      const recentlyNarrated =
+        Date.now() - voiceAssistantController.lastOutputAt < 1800;
+      if (!recentlyNarrated) {
+        speakVoiceAnnouncement('Started working on your request.');
+      }
       return;
     }
 
@@ -2863,11 +2888,7 @@ Logging in with Google... Restarting Gemini CLI to continue.
       completionAnnouncementTimerRef.current = null;
       const completionSummary = latestVoiceCompletionSummaryRef.current;
       const toolSummary = latestVoiceToolSummaryRef.current;
-      const requestContext = latestVoiceRequestContextRef.current;
       const summaryParts = ['Done.'];
-      if (requestContext) {
-        summaryParts.push(`For "${requestContext}",`);
-      }
       if (toolSummary) {
         summaryParts.push(`I ran ${toolSummary}.`);
       }
@@ -2886,6 +2907,7 @@ Logging in with Google... Restarting Gemini CLI to continue.
     voiceAssistantEnabled,
     voiceConnectionState,
     speakVoiceAnnouncement,
+    voiceAssistantController.lastOutputAt,
   ]);
 
   const [geminiMdFileCount, setGeminiMdFileCount] = useState<number>(
@@ -3360,11 +3382,16 @@ Logging in with Google... Restarting Gemini CLI to continue.
             <VoiceAssistantContextProvider
               value={{
                 enabled: voiceAssistantEnabled,
+                listening: voiceAssistantListening,
+                enable: enableVoiceAssistant,
                 toggle: toggleVoiceAssistant,
                 disable: disableVoiceAssistant,
+                setListening: setVoiceAssistantListeningState,
                 connectionState: voiceAssistantController.connectionState,
                 inputTranscript: voiceAssistantController.inputTranscript,
                 outputTranscript: voiceAssistantController.outputTranscript,
+                assistantSpeaking: voiceAssistantController.assistantSpeaking,
+                outputLevel: voiceAssistantController.outputLevel,
                 model: voiceAssistantController.model,
                 error: voiceAssistantController.error,
                 playbackWarning: voiceAssistantController.playbackWarning,
