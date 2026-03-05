@@ -19,6 +19,7 @@ import { useMemo, memo, useCallback, useEffect, useRef } from 'react';
 import { MAX_GEMINI_MESSAGE_LINES } from '../constants.js';
 import { useConfirmingTool } from '../hooks/useConfirmingTool.js';
 import { ToolConfirmationQueue } from './ToolConfirmationQueue.js';
+import { useOptionalVoiceAssistant } from '../contexts/VoiceAssistantContext.js';
 
 const MemoizedHistoryItemDisplay = memo(HistoryItemDisplay);
 const MemoizedAppHeader = memo(AppHeader);
@@ -31,10 +32,15 @@ export const MainContent = () => {
   const { version } = useAppContext();
   const uiState = useUIState();
   const isAlternateBuffer = useAlternateBuffer();
+  const voiceAssistant = useOptionalVoiceAssistant();
 
   const confirmingTool = useConfirmingTool();
   const showConfirmationQueue = confirmingTool !== null;
   const confirmingToolCallId = confirmingTool?.tool.callId;
+  const voiceAssistantOutput =
+    voiceAssistant?.enabled && voiceAssistant.outputTranscript.trim().length > 0
+      ? voiceAssistant.outputTranscript.trim()
+      : null;
 
   const scrollableListRef = useRef<VirtualizedListRef<unknown>>(null);
 
@@ -121,6 +127,18 @@ export const MainContent = () => {
         {showConfirmationQueue && confirmingTool && (
           <ToolConfirmationQueue confirmingTool={confirmingTool} />
         )}
+        {voiceAssistantOutput && (
+          <HistoryItemDisplay
+            key="voice-assistant-output"
+            availableTerminalHeight={
+              uiState.constrainHeight ? staticAreaMaxItemHeight : undefined
+            }
+            terminalWidth={mainAreaWidth}
+            item={{ id: 0, type: 'gemini', text: voiceAssistantOutput }}
+            isPending={false}
+            isExpandable={true}
+          />
+        )}
       </Box>
     ),
     [
@@ -130,6 +148,7 @@ export const MainContent = () => {
       mainAreaWidth,
       showConfirmationQueue,
       confirmingTool,
+      voiceAssistantOutput,
     ],
   );
 

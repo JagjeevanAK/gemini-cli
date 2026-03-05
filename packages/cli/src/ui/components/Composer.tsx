@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { Box, Text, useIsScreenReaderEnabled } from 'ink';
 import {
   ApprovalMode,
@@ -41,6 +41,7 @@ import { TodoTray } from './messages/Todo.js';
 import { getInlineThinkingMode } from '../utils/inlineThinkingMode.js';
 import { isContextUsageHigh } from '../utils/contextUsage.js';
 import { theme } from '../semantic-colors.js';
+import { useOptionalVoiceAssistant } from '../contexts/VoiceAssistantContext.js';
 
 export const Composer = ({ isFocused = true }: { isFocused?: boolean }) => {
   const config = useConfig();
@@ -48,12 +49,18 @@ export const Composer = ({ isFocused = true }: { isFocused?: boolean }) => {
   const isScreenReaderEnabled = useIsScreenReaderEnabled();
   const uiState = useUIState();
   const uiActions = useUIActions();
+  const voiceAssistant = useOptionalVoiceAssistant();
   const { vimEnabled, vimMode } = useVimMode();
   const inlineThinkingMode = getInlineThinkingMode(settings);
   const terminalWidth = uiState.terminalWidth;
   const isNarrow = isNarrowWidth(terminalWidth);
   const debugConsoleMaxHeight = Math.floor(Math.max(terminalWidth * 0.2, 5));
   const [suggestionsVisible, setSuggestionsVisible] = useState(false);
+  const voiceDraftRef = useRef('');
+  const lastMirroredVoiceTranscriptRef = useRef('');
+  const voiceAssistantEnabled = voiceAssistant?.enabled ?? false;
+  const voiceAssistantListening = voiceAssistant?.listening ?? false;
+  const voiceAssistantInputTranscript = voiceAssistant?.inputTranscript ?? '';
 
   const isAlternateBuffer = useAlternateBuffer();
   const { showApprovalModeIndicator } = uiState;
@@ -100,6 +107,70 @@ export const Composer = ({ isFocused = true }: { isFocused?: boolean }) => {
     uiState.shortcutsHelpVisible,
     isPassiveShortcutsHelpState,
     setShortcutsHelpVisible,
+  ]);
+
+  useEffect(() => {
+    const canMirrorToInput =
+      uiState.isInputActive &&
+      !uiState.shellModeActive &&
+      !uiState.embeddedShellFocused;
+    const suppressVoiceMirror = hasPendingActionRequired;
+    const transcript = voiceAssistantInputTranscript.trim();
+    const currentDraft = uiState.buffer.text;
+    const previousVoiceDraft = voiceDraftRef.current;
+    const isVoiceOwnedDraft =
+      previousVoiceDraft.length > 0 && currentDraft === previousVoiceDraft;
+    const transcriptChanged =
+      transcript !== lastMirroredVoiceTranscriptRef.current;
+
+    if (!canMirrorToInput || !voiceAssistantEnabled || suppressVoiceMirror) {
+      if (isVoiceOwnedDraft && currentDraft.length > 0) {
+        uiState.buffer.setText('');
+      }
+      voiceDraftRef.current = '';
+      lastMirroredVoiceTranscriptRef.current = '';
+      return;
+    }
+
+    if (
+      transcript &&
+      transcriptChanged &&
+      (currentDraft.length === 0 || isVoiceOwnedDraft)
+    ) {
+      if (currentDraft !== transcript) {
+        uiState.buffer.setText(transcript, 'end');
+      }
+      voiceDraftRef.current = transcript;
+      lastMirroredVoiceTranscriptRef.current = transcript;
+      return;
+    }
+
+    if (!transcript) {
+      lastMirroredVoiceTranscriptRef.current = '';
+    }
+
+    // Clear only when transcript has been consumed/reset by voice controller.
+    // This keeps the final spoken command visible after key release.
+    if (
+      !voiceAssistantListening &&
+      !transcript &&
+      isVoiceOwnedDraft &&
+      currentDraft.length > 0
+    ) {
+      uiState.buffer.setText('');
+    }
+    if (!voiceAssistantListening && !transcript) {
+      voiceDraftRef.current = '';
+    }
+  }, [
+    hasPendingActionRequired,
+    uiState.buffer,
+    uiState.embeddedShellFocused,
+    uiState.isInputActive,
+    uiState.shellModeActive,
+    voiceAssistantEnabled,
+    voiceAssistantInputTranscript,
+    voiceAssistantListening,
   ]);
 
   const showShortcutsHelp =
