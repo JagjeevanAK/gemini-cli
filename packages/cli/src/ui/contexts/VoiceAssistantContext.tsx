@@ -10,8 +10,11 @@ import type { VoiceAssistantControllerState } from '../hooks/useVoiceAssistantCo
 export interface VoiceAssistantContextValue
   extends VoiceAssistantControllerState {
   enabled: boolean;
+  listening: boolean;
+  enable: () => void;
   toggle: () => void;
   disable: () => void;
+  setListening: (listening: boolean) => void;
   speak: (text: string) => boolean;
   lastOutputAt: number;
 }
