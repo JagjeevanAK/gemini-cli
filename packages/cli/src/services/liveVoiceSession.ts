@@ -8,6 +8,7 @@ import { EventEmitter } from 'node:events';
 import type { Config } from '@google/gemini-cli-core';
 import {
   ActivityHandling,
+  type AudioTranscriptionConfig,
   EndSensitivity,
   Modality,
   type FunctionCall,
@@ -161,106 +162,145 @@ export class LiveVoiceSession extends EventEmitter<LiveVoiceEvents> {
     });
 
     let lastError: Error | undefined;
-    for (let index = 0; index < candidateModels.length; index += 1) {
-      const candidateModel = candidateModels[index];
-      try {
-        const session = await ai.live.connect({
-          model: candidateModel,
-          config: {
-            ...(params.systemInstruction
-              ? { systemInstruction: params.systemInstruction }
-              : {}),
-            responseModalities: [Modality.AUDIO],
-            // Keep transcription config empty for compatibility; some Live API
-            // variants reject additional fields like languageCode.
-            inputAudioTranscription: {},
-            outputAudioTranscription: {},
-            ...(advancedVad
-              ? {
-                  proactivity: {
-                    proactiveAudio: false,
-                  },
-                  realtimeInputConfig: {
-                    activityHandling:
-                      ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
-                    automaticActivityDetection: {
-                      endOfSpeechSensitivity:
-                        EndSensitivity.END_SENSITIVITY_LOW,
-                      silenceDurationMs: serverSilenceMs,
-                    },
-                  },
-                }
-              : {}),
-            tools: params.tools,
-          },
-          callbacks: {
-            onopen: () => {
-              this.sessionOpenedAtMs = Date.now();
-              this.allowAudioWithoutSetup = false;
-              voiceDebugLog('session.open', { model: candidateModel });
-              this.emit('open');
-            },
-            onmessage: (message: LiveServerMessage) => {
-              this.handleServerMessage(message);
-            },
-            onerror: (error) => {
-              voiceDebugLog('session.error', {
-                message: normalizeError(error.error).message,
-              });
-              this.emit('error', normalizeError(error.error));
-            },
-            onclose: (event) => {
-              voiceDebugLog('session.close', {
-                model: this.model,
-                closing: this.closing,
-                code: event.code,
-                reason: event.reason || null,
-                wasClean: event.wasClean,
-                setupComplete: this.setupComplete,
-                sentAudioChunks: this.sentAudioChunks,
-                sentAudioBytes: this.sentAudioBytes,
-                droppedAudioChunksBeforeSetup:
-                  this.droppedAudioChunksBeforeSetup,
-                recvAudioChunks: this.recvAudioChunks,
-                recvAudioBytes: this.recvAudioBytes,
-              });
-              this.session = undefined;
-              this.sessionOpenedAtMs = 0;
-              this.allowAudioWithoutSetup = false;
-              if (!this.closing) {
-                this.emit('close');
-              }
-              this.closing = false;
-            },
-          },
-        });
+    const transcriptionConfigs: Array<{
+      inputAudioTranscription: AudioTranscriptionConfig;
+      usedLanguageHint: boolean;
+      requestedLanguageCode: string | null;
+    }> = [
+      {
+        // Keep transcription config empty for compatibility; current Live
+        // setup variants reject unknown fields like `languageCode`.
+        inputAudioTranscription: {},
+        usedLanguageHint: false,
+        requestedLanguageCode: null,
+      },
+    ];
+    if (inputTranscriptionLanguageCode) {
+      voiceDebugLog('session.start.language_hint_ignored', {
+        requestedLanguageCode: inputTranscriptionLanguageCode,
+      });
+    }
 
-        this.session = session;
-        this.model = candidateModel;
-        this.sentAudioChunks = 0;
-        this.sentAudioBytes = 0;
-        this.droppedAudioChunksBeforeSetup = 0;
-        this.recvAudioChunks = 0;
-        this.recvAudioBytes = 0;
-        this.waitingForInput = null;
-        this.setupComplete = false;
-        return candidateModel;
-      } catch (error) {
-        const normalizedError = normalizeError(error);
-        lastError = normalizedError;
-        const hasNextCandidate = index < candidateModels.length - 1;
-        const shouldFallback =
-          hasNextCandidate && isQuotaExceededError(normalizedError.message);
-        voiceDebugLog('session.start.connect_failed', {
-          model: candidateModel,
-          message: normalizedError.message,
-          shouldFallback,
-          nextModel: shouldFallback ? candidateModels[index + 1] : undefined,
-        });
-        if (shouldFallback) {
-          continue;
+    modelLoop: for (let index = 0; index < candidateModels.length; index += 1) {
+      const candidateModel = candidateModels[index];
+      for (
+        let transcriptionIndex = 0;
+        transcriptionIndex < transcriptionConfigs.length;
+        transcriptionIndex += 1
+      ) {
+        const transcriptionConfig = transcriptionConfigs[transcriptionIndex];
+        try {
+          const session = await ai.live.connect({
+            model: candidateModel,
+            config: {
+              ...(params.systemInstruction
+                ? { systemInstruction: params.systemInstruction }
+                : {}),
+              responseModalities: [Modality.AUDIO],
+              inputAudioTranscription:
+                transcriptionConfig.inputAudioTranscription,
+              outputAudioTranscription: {},
+              ...(advancedVad
+                ? {
+                    proactivity: {
+                      proactiveAudio: false,
+                    },
+                    realtimeInputConfig: {
+                      activityHandling:
+                        ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+                      automaticActivityDetection: {
+                        endOfSpeechSensitivity:
+                          EndSensitivity.END_SENSITIVITY_LOW,
+                        silenceDurationMs: serverSilenceMs,
+                      },
+                    },
+                  }
+                : {}),
+              tools: params.tools,
+            },
+            callbacks: {
+              onopen: () => {
+                this.sessionOpenedAtMs = Date.now();
+                this.allowAudioWithoutSetup = false;
+                voiceDebugLog('session.open', {
+                  model: candidateModel,
+                  usedLanguageHint: transcriptionConfig.usedLanguageHint,
+                  languageCode: transcriptionConfig.requestedLanguageCode,
+                });
+                this.emit('open');
+              },
+              onmessage: (message: LiveServerMessage) => {
+                this.handleServerMessage(message);
+              },
+              onerror: (error) => {
+                voiceDebugLog('session.error', {
+                  message: normalizeError(error.error).message,
+                });
+                this.emit('error', normalizeError(error.error));
+              },
+              onclose: (event) => {
+                voiceDebugLog('session.close', {
+                  model: this.model,
+                  closing: this.closing,
+                  code: event.code,
+                  reason: event.reason || null,
+                  wasClean: event.wasClean,
+                  setupComplete: this.setupComplete,
+                  sentAudioChunks: this.sentAudioChunks,
+                  sentAudioBytes: this.sentAudioBytes,
+                  droppedAudioChunksBeforeSetup:
+                    this.droppedAudioChunksBeforeSetup,
+                  recvAudioChunks: this.recvAudioChunks,
+                  recvAudioBytes: this.recvAudioBytes,
+                });
+                this.session = undefined;
+                this.sessionOpenedAtMs = 0;
+                this.allowAudioWithoutSetup = false;
+                if (!this.closing) {
+                  this.emit('close');
+                }
+                this.closing = false;
+              },
+            },
+          });
+
+          this.session = session;
+          this.model = candidateModel;
+          this.sentAudioChunks = 0;
+          this.sentAudioBytes = 0;
+          this.droppedAudioChunksBeforeSetup = 0;
+          this.recvAudioChunks = 0;
+          this.recvAudioBytes = 0;
+          this.waitingForInput = null;
+          this.setupComplete = false;
+          return candidateModel;
+        } catch (error) {
+          const normalizedError = normalizeError(error);
+          lastError = normalizedError;
+          const hasFallbackWithoutLanguageHint =
+            transcriptionIndex < transcriptionConfigs.length - 1;
+          const hasNextCandidate = index < candidateModels.length - 1;
+          const shouldFallback =
+            !hasFallbackWithoutLanguageHint &&
+            hasNextCandidate &&
+            isQuotaExceededError(normalizedError.message);
+          voiceDebugLog('session.start.connect_failed', {
+            model: candidateModel,
+            message: normalizedError.message,
+            usedLanguageHint: transcriptionConfig.usedLanguageHint,
+            languageCode: transcriptionConfig.requestedLanguageCode,
+            hasFallbackWithoutLanguageHint,
+            shouldFallback,
+            nextModel: shouldFallback ? candidateModels[index + 1] : undefined,
+          });
+          if (hasFallbackWithoutLanguageHint) {
+            continue;
+          }
+          if (shouldFallback) {
+            continue modelLoop;
+          }
+          break modelLoop;
         }
-        break;
       }
     }
 
