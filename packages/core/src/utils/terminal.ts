@@ -34,7 +34,8 @@ export function disableMouseEvents() {
 }
 
 export function enableKittyKeyboardProtocol() {
-  writeToStdout('\x1b[>1u');
+  // 1 = disambiguate escape codes, 2 = include key event types (press/repeat/release).
+  writeToStdout('\x1b[>3u');
 }
 
 export function disableKittyKeyboardProtocol() {
