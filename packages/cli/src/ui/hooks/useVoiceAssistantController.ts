@@ -119,7 +119,8 @@ const OUTPUT_AUDIO_ACTIVITY_THRESHOLD = 0.008;
 const OUTPUT_LEVEL_DECAY_MS = 220;
 const OUTPUT_SPEAKING_HOLD_MS = 1200;
 const OUTPUT_TRANSCRIPT_RESET_GAP_MS = 1400;
-const OUTPUT_TRANSCRIPT_MAX_LINES = 14;
+const OUTPUT_TRANSCRIPT_HARD_RESET_GAP_MS = 2600;
+const OUTPUT_TRANSCRIPT_MAX_LINES = 10;
 const ENABLE_LOCAL_SYSTEM_ANNOUNCEMENTS =
   process.platform === 'darwin' &&
   process.env['GEMINI_VOICE_LOCAL_TTS'] === '1';
@@ -282,6 +283,79 @@ const HINT_ADDED_ACKS = [
   'Done. I passed that update to the running task.',
   'Perfect, that guidance is now in the run.',
 ] as const;
+const NON_LATIN_LANGUAGE_BASES = new Set([
+  'am',
+  'ar',
+  'be',
+  'bg',
+  'bn',
+  'bo',
+  'dz',
+  'el',
+  'fa',
+  'gu',
+  'he',
+  'hi',
+  'hy',
+  'ja',
+  'ka',
+  'kk',
+  'km',
+  'kn',
+  'ko',
+  'lo',
+  'mk',
+  'ml',
+  'mn',
+  'mr',
+  'my',
+  'ne',
+  'or',
+  'pa',
+  'ps',
+  'ru',
+  'si',
+  'sr',
+  'ta',
+  'te',
+  'th',
+  'ti',
+  'uk',
+  'ur',
+  'yi',
+  'zh',
+]);
+const NON_LATIN_SCRIPT_SUBTAGS = new Set([
+  'Arab',
+  'Armn',
+  'Beng',
+  'Cyrl',
+  'Deva',
+  'Ethi',
+  'Geor',
+  'Grek',
+  'Gujr',
+  'Guru',
+  'Hang',
+  'Hani',
+  'Hans',
+  'Hant',
+  'Hebr',
+  'Hira',
+  'Kana',
+  'Khmr',
+  'Knda',
+  'Laoo',
+  'Mlym',
+  'Mong',
+  'Mymr',
+  'Orya',
+  'Sinh',
+  'Taml',
+  'Telu',
+  'Thai',
+  'Tibt',
+]);
 
 function isTooShortDecisionTranscript(transcript: string): boolean {
   const normalized = normalizeTranscriptText(transcript);
@@ -831,6 +905,66 @@ function containsNonLatinLetters(text: string): boolean {
   return false;
 }
 
+function containsLatinLetters(text: string): boolean {
+  return /\p{Script=Latin}/u.test(text.normalize('NFKC'));
+}
+
+function normalizeScriptTag(tag: string): string {
+  if (tag.length !== 4) {
+    return tag;
+  }
+  return `${tag[0]?.toUpperCase() || ''}${tag.slice(1).toLowerCase()}`;
+}
+
+function shouldPreferLatinTranscriptDisplay(languageCode: string | undefined) {
+  if (!languageCode) {
+    return false;
+  }
+  const normalized = languageCode.trim();
+  if (!normalized) {
+    return false;
+  }
+
+  const subtags = normalized.split(/[-_]/).filter(Boolean);
+  const language = subtags[0]?.toLowerCase() || '';
+  const scriptTag = subtags
+    .slice(1)
+    .find((subtag) => subtag.length === 4 && /^[a-z]+$/i.test(subtag));
+  const normalizedScriptTag = scriptTag
+    ? normalizeScriptTag(scriptTag)
+    : undefined;
+
+  if (normalizedScriptTag === 'Latn') {
+    return true;
+  }
+  if (
+    normalizedScriptTag &&
+    NON_LATIN_SCRIPT_SUBTAGS.has(normalizedScriptTag)
+  ) {
+    return false;
+  }
+  if (!language) {
+    return false;
+  }
+  return !NON_LATIN_LANGUAGE_BASES.has(language);
+}
+
+function shouldSuppressNonLatinTranscriptDisplay(
+  transcript: string,
+  inputLanguageCode: string | undefined,
+) {
+  if (!transcript.trim()) {
+    return false;
+  }
+  if (!containsNonLatinLetters(transcript)) {
+    return false;
+  }
+  if (containsLatinLetters(transcript)) {
+    return false;
+  }
+  return shouldPreferLatinTranscriptDisplay(inputLanguageCode);
+}
+
 function containsAnyKeyword(text: string, keywords: readonly string[]) {
   return keywords.some((keyword) => text.includes(keyword));
 }
@@ -1053,7 +1187,8 @@ function appendOutputTranscriptLine(
   nextChunk: string,
   startNewLine: boolean,
 ): string {
-  const normalizedNextChunk = nextChunk.replace(/\s+/g, ' ').trim();
+  const compactChunk = nextChunk.replace(/\s+/g, ' ');
+  const normalizedNextChunk = compactChunk.trim();
   if (!normalizedNextChunk) {
     return previousTranscript;
   }
@@ -1079,7 +1214,7 @@ function appendOutputTranscriptLine(
   }
 
   const lastIndex = lines.length - 1;
-  const merged = mergeTranscriptChunk(lines[lastIndex], normalizedNextChunk)
+  const merged = mergeTranscriptChunk(lines[lastIndex], compactChunk)
     .replace(/\s+/g, ' ')
     .trim();
   lines[lastIndex] = merged || normalizedNextChunk;
@@ -1787,6 +1922,7 @@ export function useVoiceAssistantController({
   const lastTurnEndSignalAtRef = useRef(0);
   const lastInputAtRef = useRef(0);
   const latestInputTranscriptRef = useRef('');
+  const latestDisplayInputTranscriptRef = useRef('');
   const lastOutputAtRef = useRef(0);
   const lastToolCallAtRef = useRef(0);
   const lastTranscriptFallbackAtRef = useRef(0);
@@ -1813,6 +1949,7 @@ export function useVoiceAssistantController({
   const outputLevelRef = useRef(0);
   const outputLevelDecayTimerRef = useRef<NodeJS.Timeout | null>(null);
   const outputSpeakingDecayTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const resetOutputTranscriptOnNextChunkRef = useRef(false);
   const captureAudioRef = useRef(captureAudio);
   const captureStopTimerRef = useRef<NodeJS.Timeout | null>(null);
   const [lastOutputAt, setLastOutputAt] = useState<number>(0);
@@ -1917,6 +2054,7 @@ export function useVoiceAssistantController({
       }
       captureAudioRef.current = false;
       outputLevelRef.current = 0;
+      resetOutputTranscriptOnNextChunkRef.current = false;
       reconnectAttemptCountRef.current = 0;
       lastReconnectAttemptAtRef.current = 0;
       setState((prev) => ({
@@ -2053,6 +2191,7 @@ export function useVoiceAssistantController({
       localSpeechActiveRef.current = false;
       localSpeechInputGuardUntilRef.current = 0;
       outputLevelRef.current = 0;
+      resetOutputTranscriptOnNextChunkRef.current = false;
       reconnectAttemptCountRef.current = 0;
       lastReconnectAttemptAtRef.current = 0;
       setState(INITIAL_STATE);
@@ -2071,6 +2210,7 @@ export function useVoiceAssistantController({
     lastTurnEndSignalAtRef.current = 0;
     lastInputAtRef.current = 0;
     latestInputTranscriptRef.current = '';
+    latestDisplayInputTranscriptRef.current = '';
     lastOutputAtRef.current = 0;
     lastToolCallAtRef.current = 0;
     lastTranscriptFallbackAtRef.current = 0;
@@ -2110,6 +2250,7 @@ export function useVoiceAssistantController({
     localSpeechActiveRef.current = false;
     localSpeechInputGuardUntilRef.current = 0;
     outputLevelRef.current = 0;
+    resetOutputTranscriptOnNextChunkRef.current = false;
 
     setState((prev) => ({
       ...prev,
@@ -2136,6 +2277,7 @@ export function useVoiceAssistantController({
       if (!active) {
         return;
       }
+      resetOutputTranscriptOnNextChunkRef.current = true;
       const now = Date.now();
       if (
         now - lastReconnectAttemptAtRef.current >
@@ -2208,15 +2350,20 @@ export function useVoiceAssistantController({
           at + muteWindowMs,
         );
       }
-      setState((prev) => ({
-        ...prev,
-        outputTranscript: appendOutputTranscriptLine(
-          prev.outputTranscript,
-          trimmed,
-          true,
-        ),
-      }));
-      speak(trimmed);
+      const modelConnected = sessionRef.current?.isConnected() ?? false;
+      const spoken = speak(trimmed);
+      // Mirror immediately only when model speech path is unavailable.
+      // When connected, prefer server output transcripts as source of truth.
+      if (!modelConnected || !spoken) {
+        setState((prev) => ({
+          ...prev,
+          outputTranscript: appendOutputTranscriptLine(
+            prev.outputTranscript,
+            trimmed,
+            true,
+          ),
+        }));
+      }
     };
 
     const clearModelInterpretSubmitFallback = () => {
@@ -2228,6 +2375,7 @@ export function useVoiceAssistantController({
 
     const consumeInputTranscript = () => {
       latestInputTranscriptRef.current = '';
+      latestDisplayInputTranscriptRef.current = '';
       setState((prev) =>
         prev.inputTranscript
           ? {
@@ -2592,11 +2740,24 @@ export function useVoiceAssistantController({
       ) {
         lastUserUtteranceRef.current = latestInputTranscriptRef.current;
       }
+      const suppressDisplayTranscript = shouldSuppressNonLatinTranscriptDisplay(
+        latestInputTranscriptRef.current,
+        resolvedRuntimeConfig.inputTranscriptionLanguageCode,
+      );
+      if (!suppressDisplayTranscript) {
+        latestDisplayInputTranscriptRef.current =
+          latestInputTranscriptRef.current;
+      }
 
-      setState((prev) => ({
-        ...prev,
-        inputTranscript: latestInputTranscriptRef.current,
-      }));
+      const displayTranscript = latestDisplayInputTranscriptRef.current;
+      setState((prev) =>
+        prev.inputTranscript === displayTranscript
+          ? prev
+          : {
+              ...prev,
+              inputTranscript: displayTranscript,
+            },
+      );
 
       if (tryResolveDirectDecision(latestInputTranscriptRef.current)) {
         return;
@@ -2786,14 +2947,22 @@ export function useVoiceAssistantController({
       }
       recentOutputSegmentsRef.current = candidateOutputs;
       const previousOutputAt = lastOutputAtRef.current;
+      const outputGapMs = now - previousOutputAt;
+      const resetForCompletedTurn = resetOutputTranscriptOnNextChunkRef.current;
+      if (resetForCompletedTurn) {
+        resetOutputTranscriptOnNextChunkRef.current = false;
+      }
       setLastOutputAt(now);
       lastOutputAtRef.current = now;
       setState((prev) => ({
         ...prev,
         outputTranscript: appendOutputTranscriptLine(
-          prev.outputTranscript,
+          resetForCompletedTurn ||
+            outputGapMs > OUTPUT_TRANSCRIPT_HARD_RESET_GAP_MS
+            ? ''
+            : prev.outputTranscript,
           text,
-          now - previousOutputAt > OUTPUT_TRANSCRIPT_RESET_GAP_MS,
+          outputGapMs > OUTPUT_TRANSCRIPT_RESET_GAP_MS,
         ),
       }));
     };
@@ -2873,6 +3042,13 @@ export function useVoiceAssistantController({
       }));
     };
 
+    const onTurnComplete = (_reason: string | null) => {
+      if (!active) {
+        return;
+      }
+      resetOutputTranscriptOnNextChunkRef.current = true;
+    };
+
     const onToolCall = (functionCalls: FunctionCall[]) => {
       lastToolCallAtRef.current = Date.now();
       clearModelInterpretSubmitFallback();
@@ -2886,6 +3062,17 @@ export function useVoiceAssistantController({
           if (call.name === 'submit_user_request') {
             const submitArgs = asObject(call.args);
             const argText = asStringArg(submitArgs['text']);
+            if (argText) {
+              latestDisplayInputTranscriptRef.current = argText;
+              setState((prev) =>
+                prev.inputTranscript === argText
+                  ? prev
+                  : {
+                      ...prev,
+                      inputTranscript: argText,
+                    },
+              );
+            }
             const now = Date.now();
             const fallbackCandidate = buildCandidateUtterance(
               recentInputSegmentsRef.current,
@@ -2976,6 +3163,7 @@ export function useVoiceAssistantController({
 
     session.on('open', onOpen);
     session.on('close', onClose);
+    session.on('turnComplete', onTurnComplete);
     session.on('inputTranscript', onInputTranscript);
     session.on('outputTranscript', onOutputTranscript);
     session.on('outputAudioChunk', onOutputAudioChunk);
@@ -3244,6 +3432,7 @@ export function useVoiceAssistantController({
       unsubscribeAudioState();
       session.off('open', onOpen);
       session.off('close', onClose);
+      session.off('turnComplete', onTurnComplete);
       session.off('inputTranscript', onInputTranscript);
       session.off('outputTranscript', onOutputTranscript);
       session.off('outputAudioChunk', onOutputAudioChunk);

@@ -39,6 +39,7 @@ export interface VoiceOutputAudioChunk {
 export type LiveVoiceEvents = {
   open: [];
   close: [];
+  turnComplete: [string | null];
   inputTranscript: [string];
   outputTranscript: [string];
   outputAudioChunk: [VoiceOutputAudioChunk];
@@ -166,20 +167,27 @@ export class LiveVoiceSession extends EventEmitter<LiveVoiceEvents> {
       inputAudioTranscription: AudioTranscriptionConfig;
       usedLanguageHint: boolean;
       requestedLanguageCode: string | null;
-    }> = [
-      {
-        // Keep transcription config empty for compatibility; current Live
-        // setup variants reject unknown fields like `languageCode`.
-        inputAudioTranscription: {},
-        usedLanguageHint: false,
-        requestedLanguageCode: null,
-      },
-    ];
+    }> = [];
     if (inputTranscriptionLanguageCode) {
-      voiceDebugLog('session.start.language_hint_ignored', {
+      // Try honoring the requested transcription language first, then
+      // automatically fall back to an empty transcription config for
+      // compatibility with Live backends that reject this hint.
+      transcriptionConfigs.push({
+        inputAudioTranscription: {
+          languageCode: inputTranscriptionLanguageCode,
+        } as AudioTranscriptionConfig,
+        usedLanguageHint: true,
+        requestedLanguageCode: inputTranscriptionLanguageCode,
+      });
+      voiceDebugLog('session.start.language_hint_requested', {
         requestedLanguageCode: inputTranscriptionLanguageCode,
       });
     }
+    transcriptionConfigs.push({
+      inputAudioTranscription: {},
+      usedLanguageHint: false,
+      requestedLanguageCode: null,
+    });
 
     modelLoop: for (let index = 0; index < candidateModels.length; index += 1) {
       const candidateModel = candidateModels[index];
@@ -497,6 +505,7 @@ export class LiveVoiceSession extends EventEmitter<LiveVoiceEvents> {
           turnComplete: Boolean(turnComplete),
           turnCompleteReason: turnCompleteReason || null,
         });
+        this.emit('turnComplete', turnCompleteReason || null);
       }
 
       if (inputTranscription?.text) {
