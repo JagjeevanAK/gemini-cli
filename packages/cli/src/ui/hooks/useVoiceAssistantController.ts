@@ -10,11 +10,11 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  estimateTokenCountSync,
   getErrorMessage,
   tokenLimit,
   type Config,
 } from '@google/gemini-cli-core';
-import { estimateTokenCountSync } from '@google/gemini-cli-core/src/utils/tokenCalculation.js';
 import {
   type FunctionCall,
   type FunctionResponse,
@@ -2424,14 +2424,18 @@ export function useVoiceAssistantController({
     [],
   );
 
-  const buildVoiceContextSummary = useCallback(() => buildVoiceSessionSummary({
-      previousSummary: voiceContextSummaryRef.current,
-      runtimeStatus: getRuntimeStatusRef.current(),
-      pendingActions: getPendingActionsRef.current(),
-      recentEntries: voiceContextEntriesRef.current,
-      lastUserUtterance: lastUserUtteranceRef.current,
-      contextSyncMessage: lastContextSyncMessageRef.current,
-    }), []);
+  const buildVoiceContextSummary = useCallback(
+    () =>
+      buildVoiceSessionSummary({
+        previousSummary: voiceContextSummaryRef.current,
+        runtimeStatus: getRuntimeStatusRef.current(),
+        pendingActions: getPendingActionsRef.current(),
+        recentEntries: voiceContextEntriesRef.current,
+        lastUserUtterance: lastUserUtteranceRef.current,
+        contextSyncMessage: lastContextSyncMessageRef.current,
+      }),
+    [],
+  );
 
   const maybePerformVoiceContextRollover = useCallback(() => {
     if (
@@ -2937,7 +2941,8 @@ export function useVoiceAssistantController({
         text: prompt,
       });
 
-      const speakViaModel = () => enqueueModelTurn({
+      const speakViaModel = () =>
+        enqueueModelTurn({
           kind: 'notification',
           text: [
             `Notification: ${prompt}`,
