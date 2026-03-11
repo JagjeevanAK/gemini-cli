@@ -800,6 +800,16 @@ const SETTINGS_SCHEMA = {
         description: 'Advanced runtime configuration for voice assistant mode.',
         showInDialog: false,
         properties: {
+          persona: {
+            type: 'string',
+            label: 'Voice Persona',
+            category: 'UI',
+            requiresRestart: false,
+            default: undefined as string | undefined,
+            description:
+              'Selected Google Live API prebuilt voice persona for assistant speech.',
+            showInDialog: false,
+          },
           model: {
             type: 'string',
             label: 'Voice Model',
@@ -815,9 +825,9 @@ const SETTINGS_SCHEMA = {
             label: 'Voice Input Language Code',
             category: 'UI',
             requiresRestart: false,
-            default: 'en-US',
+            default: undefined as string | undefined,
             description:
-              'Language code hint for voice input transcription (for example: en-US, hi-IN).',
+              'Optional voice input language hint. Reserved for future Live backend support and currently not sent.',
             showInDialog: false,
           },
           forceTurnEndOnSilence: {

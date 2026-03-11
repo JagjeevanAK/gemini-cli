@@ -24,9 +24,12 @@ const ENDIAN = 'little';
 const RMS_ALPHA = 0.2;
 const RMS_SCALE = 20.0;
 const UI_UPDATE_INTERVAL_MS = 30;
-const INFERENCE_INTERVAL_MS = 50;
-const SPEECH_THRESHOLD = 0.6;
+const MIN_INFERENCE_INTERVAL_MS = 16;
+const MAX_INFERENCE_FRAMES_PER_TICK = 4;
+const SPEECH_START_THRESHOLD = 0.6;
+const SPEECH_END_THRESHOLD = 0.45;
 const TALKING_HOLD_MS = 50;
+const SILENCE_HOLD_MS = 220;
 const NOISE_FLOOR = 0.015;
 const DEFAULT_FRAME_SIZE = 512;
 const MAX_BUFFER_FRAMES = 50;
@@ -85,6 +88,71 @@ const computeRms = (samples: Float32Array) => {
   }
   return Math.sqrt(sum / samples.length);
 };
+
+interface TalkingStateSnapshot {
+  isTalking: boolean;
+  speechCandidateSince: number | null;
+  silenceCandidateSince: number | null;
+}
+
+function getTargetInferenceIntervalMs(frameSize: number) {
+  const frameDurationMs = Math.round((frameSize / SAMPLE_RATE) * 1000);
+  return Math.max(MIN_INFERENCE_INTERVAL_MS, frameDurationMs || 0);
+}
+
+function reduceTalkingState(
+  previousState: TalkingStateSnapshot,
+  probability: number,
+  now: number,
+): TalkingStateSnapshot {
+  if (previousState.isTalking) {
+    if (probability >= SPEECH_END_THRESHOLD) {
+      return {
+        isTalking: true,
+        speechCandidateSince: previousState.speechCandidateSince,
+        silenceCandidateSince: null,
+      };
+    }
+
+    const silenceCandidateSince = previousState.silenceCandidateSince ?? now;
+    if (now - silenceCandidateSince >= SILENCE_HOLD_MS) {
+      return {
+        isTalking: false,
+        speechCandidateSince: null,
+        silenceCandidateSince,
+      };
+    }
+
+    return {
+      isTalking: true,
+      speechCandidateSince: previousState.speechCandidateSince,
+      silenceCandidateSince,
+    };
+  }
+
+  if (probability > SPEECH_START_THRESHOLD) {
+    const speechCandidateSince = previousState.speechCandidateSince ?? now;
+    if (now - speechCandidateSince >= TALKING_HOLD_MS) {
+      return {
+        isTalking: true,
+        speechCandidateSince,
+        silenceCandidateSince: null,
+      };
+    }
+
+    return {
+      isTalking: false,
+      speechCandidateSince,
+      silenceCandidateSince: null,
+    };
+  }
+
+  return {
+    isTalking: false,
+    speechCandidateSince: null,
+    silenceCandidateSince: null,
+  };
+}
 
 const toFloat32 = (buffer: Buffer) => {
   const sampleCount = Math.floor(buffer.length / 2);
@@ -256,6 +324,7 @@ class AudioEngine extends EventEmitter<AudioEvents> {
   private lastErrorMessage: string | null = null;
   private permissionRequired = false;
   private speechCandidateSince: number | null = null;
+  private silenceCandidateSince: number | null = null;
   private subscribers = 0;
   private pcmSubscribers = 0;
   private sourceSampleRate = SAMPLE_RATE;
@@ -417,6 +486,7 @@ class AudioEngine extends EventEmitter<AudioEvents> {
     this.micStream = undefined;
     this.inferenceInFlight = false;
     this.speechCandidateSince = null;
+    this.silenceCandidateSince = null;
     this.isTalking = false;
     this.lastProbability = 0;
     this.sourceSampleRate = SAMPLE_RATE;
@@ -487,9 +557,14 @@ class AudioEngine extends EventEmitter<AudioEvents> {
       clearInterval(this.inferenceTimer);
     }
 
+    const intervalMs = getTargetInferenceIntervalMs(this.frameSize);
+    voiceDebugLog('audio.vad.inference_loop_start', {
+      frameSize: this.frameSize,
+      intervalMs,
+    });
     this.inferenceTimer = setInterval(() => {
       void this.runInferenceTick();
-    }, INFERENCE_INTERVAL_MS);
+    }, intervalMs);
 
     this.inferenceTimer.unref?.();
   }
@@ -717,20 +792,18 @@ class AudioEngine extends EventEmitter<AudioEvents> {
   }
 
   private updateTalkingState(probability: number) {
-    const now = Date.now();
-
-    if (probability > SPEECH_THRESHOLD) {
-      if (this.speechCandidateSince === null) {
-        this.speechCandidateSince = now;
-      }
-
-      if (now - this.speechCandidateSince >= TALKING_HOLD_MS) {
-        this.isTalking = true;
-      }
-    } else {
-      this.speechCandidateSince = null;
-      this.isTalking = false;
-    }
+    const nextState = reduceTalkingState(
+      {
+        isTalking: this.isTalking,
+        speechCandidateSince: this.speechCandidateSince,
+        silenceCandidateSince: this.silenceCandidateSince,
+      },
+      probability,
+      Date.now(),
+    );
+    this.isTalking = nextState.isTalking;
+    this.speechCandidateSince = nextState.speechCandidateSince;
+    this.silenceCandidateSince = nextState.silenceCandidateSince;
   }
 
   private updateState(outputs: SessionOutputs) {
@@ -749,22 +822,31 @@ class AudioEngine extends EventEmitter<AudioEvents> {
 
   private async runInferenceTick() {
     if (!this.session || this.inferenceInFlight) return;
-    const frame = this.dequeueFrame();
-    if (!frame) return;
-
     this.inferenceInFlight = true;
 
     try {
-      const outputs = await this.session.run(this.buildFeeds(frame));
+      let processedFrames = 0;
+      while (processedFrames < MAX_INFERENCE_FRAMES_PER_TICK) {
+        const frame = this.dequeueFrame();
+        if (!frame) {
+          break;
+        }
 
-      if (!this.running) return;
+        const outputs = await this.session.run(this.buildFeeds(frame));
 
-      this.clearErrorState();
-      const probability = this.extractProbability(outputs);
-      this.lastProbability = probability;
-      this.updateTalkingState(probability);
-      this.updateState(outputs);
-      this.emitIfNeeded(true);
+        if (!this.running) return;
+
+        this.clearErrorState();
+        const probability = this.extractProbability(outputs);
+        this.lastProbability = probability;
+        this.updateTalkingState(probability);
+        this.updateState(outputs);
+        processedFrames += 1;
+      }
+
+      if (processedFrames > 0) {
+        this.emitIfNeeded(true);
+      }
     } catch (error) {
       const normalizedError = normalizeError(error);
       this.setErrorState(normalizedError);
@@ -816,3 +898,8 @@ class AudioEngine extends EventEmitter<AudioEvents> {
 }
 
 export const audioEngine = new AudioEngine();
+
+export const __testables = {
+  getTargetInferenceIntervalMs,
+  reduceTalkingState,
+};

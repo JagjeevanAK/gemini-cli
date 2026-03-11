@@ -14,6 +14,7 @@ import {
   type FunctionCall,
   type FunctionResponse,
   type LiveServerMessage,
+  type SpeechConfigUnion,
   type ToolListUnion,
   type Session,
 } from '@google/genai';
@@ -49,6 +50,7 @@ export type LiveVoiceEvents = {
 
 export interface StartVoiceSessionParams {
   model?: string;
+  voiceName?: string;
   inputTranscriptionLanguageCode?: string;
   advancedVad?: boolean;
   serverSilenceMs?: number;
@@ -150,10 +152,24 @@ export class LiveVoiceSession extends EventEmitter<LiveVoiceEvents> {
       params.inputTranscriptionLanguageCode.trim().length > 0
         ? params.inputTranscriptionLanguageCode.trim()
         : undefined;
+    const voiceName =
+      typeof params.voiceName === 'string' && params.voiceName.trim().length > 0
+        ? params.voiceName.trim()
+        : undefined;
+    const speechConfig: SpeechConfigUnion | undefined = voiceName
+      ? {
+          voiceConfig: {
+            prebuiltVoiceConfig: {
+              voiceName,
+            },
+          },
+        }
+      : undefined;
     this.setupCompleteWaitMs = setupWaitMs;
     voiceDebugLog('session.start.request', {
       model: requestedModel,
       candidateModels,
+      voiceName: voiceName || null,
       inputTranscriptionLanguageCode: inputTranscriptionLanguageCode || null,
       advancedVad,
       serverSilenceMs,
@@ -169,18 +185,12 @@ export class LiveVoiceSession extends EventEmitter<LiveVoiceEvents> {
       requestedLanguageCode: string | null;
     }> = [];
     if (inputTranscriptionLanguageCode) {
-      // Try honoring the requested transcription language first, then
-      // automatically fall back to an empty transcription config for
-      // compatibility with Live backends that reject this hint.
-      transcriptionConfigs.push({
-        inputAudioTranscription: {
-          languageCode: inputTranscriptionLanguageCode,
-        } as AudioTranscriptionConfig,
-        usedLanguageHint: true,
+      // The current Live backend rejects setup.input_audio_transcription
+      // languageCode, so keep the setting observable in logs but do not send
+      // the unsupported field.
+      voiceDebugLog('session.start.language_hint_ignored', {
         requestedLanguageCode: inputTranscriptionLanguageCode,
-      });
-      voiceDebugLog('session.start.language_hint_requested', {
-        requestedLanguageCode: inputTranscriptionLanguageCode,
+        reason: 'current_live_backend_rejects_language_code',
       });
     }
     transcriptionConfigs.push({
@@ -204,6 +214,7 @@ export class LiveVoiceSession extends EventEmitter<LiveVoiceEvents> {
               ...(params.systemInstruction
                 ? { systemInstruction: params.systemInstruction }
                 : {}),
+              ...(speechConfig ? { speechConfig } : {}),
               responseModalities: [Modality.AUDIO],
               inputAudioTranscription:
                 transcriptionConfig.inputAudioTranscription,
@@ -232,6 +243,7 @@ export class LiveVoiceSession extends EventEmitter<LiveVoiceEvents> {
                 this.allowAudioWithoutSetup = false;
                 voiceDebugLog('session.open', {
                   model: candidateModel,
+                  voiceName: voiceName || null,
                   usedLanguageHint: transcriptionConfig.usedLanguageHint,
                   languageCode: transcriptionConfig.requestedLanguageCode,
                 });
@@ -294,6 +306,7 @@ export class LiveVoiceSession extends EventEmitter<LiveVoiceEvents> {
             isQuotaExceededError(normalizedError.message);
           voiceDebugLog('session.start.connect_failed', {
             model: candidateModel,
+            voiceName: voiceName || null,
             message: normalizedError.message,
             usedLanguageHint: transcriptionConfig.usedLanguageHint,
             languageCode: transcriptionConfig.requestedLanguageCode,
@@ -315,6 +328,7 @@ export class LiveVoiceSession extends EventEmitter<LiveVoiceEvents> {
     const finalError =
       lastError || new Error('Failed to start live voice session.');
     voiceDebugLog('session.start.failed', {
+      voiceName: voiceName || null,
       message: finalError.message,
     });
     throw finalError;
@@ -500,14 +514,6 @@ export class LiveVoiceSession extends EventEmitter<LiveVoiceEvents> {
         }
       }
 
-      if (turnComplete || turnCompleteReason) {
-        voiceDebugLog('server.turn_complete', {
-          turnComplete: Boolean(turnComplete),
-          turnCompleteReason: turnCompleteReason || null,
-        });
-        this.emit('turnComplete', turnCompleteReason || null);
-      }
-
       if (inputTranscription?.text) {
         voiceDebugLog('server.input_transcript', {
           length: inputTranscription.text.length,
@@ -555,6 +561,14 @@ export class LiveVoiceSession extends EventEmitter<LiveVoiceEvents> {
             mimeType,
           });
         }
+      }
+
+      if (turnComplete || turnCompleteReason) {
+        voiceDebugLog('server.turn_complete', {
+          turnComplete: Boolean(turnComplete),
+          turnCompleteReason: turnCompleteReason || null,
+        });
+        this.emit('turnComplete', turnCompleteReason || null);
       }
     }
 

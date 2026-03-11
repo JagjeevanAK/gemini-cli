@@ -2326,6 +2326,7 @@ Logging in with Google... Restarting Gemini CLI to continue.
   const [voiceAssistantListening, setVoiceAssistantListening] = useState(false);
   const voiceAssistantRuntimeConfig = useMemo<VoiceAssistantRuntimeConfig>(
     () => ({
+      persona: settings.merged.ui.voiceAssistant.persona,
       model: settings.merged.ui.voiceAssistant.model,
       inputTranscriptionLanguageCode:
         settings.merged.ui.voiceAssistant.inputTranscriptionLanguageCode,
@@ -2353,6 +2354,7 @@ Logging in with Google... Restarting Gemini CLI to continue.
       settings.merged.ui.voiceAssistant.localAssistantFallbackMs,
       settings.merged.ui.voiceAssistant.maxSpeechSegmentMs,
       settings.merged.ui.voiceAssistant.model,
+      settings.merged.ui.voiceAssistant.persona,
       settings.merged.ui.voiceAssistant.serverSilenceMs,
       settings.merged.ui.voiceAssistant.setupWaitMs,
       settings.merged.ui.voiceAssistant.transcriptTurnCooldownMs,
@@ -2360,6 +2362,44 @@ Logging in with Google... Restarting Gemini CLI to continue.
       settings.merged.ui.voiceAssistant.turnEndSilenceMs,
     ],
   );
+  const voiceAssistantContextSync = useMemo(() => {
+    for (
+      let index = historyManager.history.length - 1;
+      index >= 0;
+      index -= 1
+    ) {
+      const item = historyManager.history[index];
+      if (item.type === 'compression' && !item.compression.isPending) {
+        const originalTokenCount = item.compression.originalTokenCount;
+        const newTokenCount = item.compression.newTokenCount;
+        const message =
+          typeof originalTokenCount === 'number' &&
+          typeof newTokenCount === 'number'
+            ? `Conversation context compressed from ${originalTokenCount} tokens to ${newTokenCount} tokens.`
+            : 'Conversation context was compressed.';
+        return {
+          generation: item.id,
+          message,
+        };
+      }
+
+      if (
+        item.type === 'info' &&
+        (item.text.startsWith('Context compressed from ') ||
+          item.text === 'Conversation context has been cleared.')
+      ) {
+        return {
+          generation: item.id,
+          message: item.text,
+        };
+      }
+    }
+
+    return {
+      generation: 0,
+      message: null,
+    };
+  }, [historyManager.history]);
 
   useEffect(() => {
     voiceDebugLog('app.voice_debug_probe', {
@@ -2693,9 +2733,12 @@ Logging in with Google... Restarting Gemini CLI to continue.
     enabled: voiceAssistantEnabled,
     captureAudio: voiceAssistantListening,
     runtimeConfig: voiceAssistantRuntimeConfig,
+    contextSyncGeneration: voiceAssistantContextSync.generation,
+    contextSyncMessage: voiceAssistantContextSync.message,
     isAgentBusy: isVoiceAgentBusy,
     onDisableRequested: disableVoiceAssistant,
     getRuntimeStatus: getRuntimeVoiceStatus,
+    getLatestHistoryId: () => uiState.history.at(-1)?.id ?? 0,
     getPendingActions: getPendingVoiceActions,
     submitUserRequest: submitVoiceUserRequest,
     submitUserHint: submitVoiceHint,
@@ -3390,6 +3433,7 @@ Logging in with Google... Restarting Gemini CLI to continue.
                 connectionState: voiceAssistantController.connectionState,
                 inputTranscript: voiceAssistantController.inputTranscript,
                 outputTranscript: voiceAssistantController.outputTranscript,
+                outputHistory: voiceAssistantController.outputHistory,
                 assistantSpeaking: voiceAssistantController.assistantSpeaking,
                 outputLevel: voiceAssistantController.outputLevel,
                 model: voiceAssistantController.model,

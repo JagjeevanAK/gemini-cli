@@ -9,6 +9,7 @@ import commandExists from 'command-exists';
 import { voiceDebugLog } from './voiceDebugLogger.js';
 
 const PLAYER_COMMAND = 'play';
+const PCM_BYTES_PER_SECOND = 24000 * 2;
 const PLAYER_ARGS = [
   '-q',
   '-t',
@@ -34,6 +35,7 @@ export class AudioPlayback {
   private available = false;
   private startPromise: Promise<AudioPlaybackStartResult> | null = null;
   private nextRestartAllowedAt = 0;
+  private playbackEndsAt = 0;
 
   async start(): Promise<AudioPlaybackStartResult> {
     if (this.player && this.player.stdin.writable) {
@@ -91,6 +93,7 @@ export class AudioPlayback {
         });
         this.player = undefined;
         this.available = false;
+        this.playbackEndsAt = 0;
       });
       player.on('error', (error) => {
         voiceDebugLog('audio.playback.error', {
@@ -98,6 +101,7 @@ export class AudioPlayback {
         });
         this.player = undefined;
         this.available = false;
+        this.playbackEndsAt = 0;
       });
       this.player = player;
       this.available = true;
@@ -131,11 +135,22 @@ export class AudioPlayback {
       }
       return;
     }
+    const durationMs = Math.max(
+      1,
+      Math.round((chunk.length / PCM_BYTES_PER_SECOND) * 1000),
+    );
+    this.playbackEndsAt =
+      Math.max(this.playbackEndsAt, Date.now()) + durationMs;
     this.player.stdin.write(chunk);
+  }
+
+  getPendingPlaybackMs() {
+    return Math.max(0, this.playbackEndsAt - Date.now());
   }
 
   stop() {
     if (!this.player) {
+      this.playbackEndsAt = 0;
       return;
     }
 
@@ -153,6 +168,7 @@ export class AudioPlayback {
       this.player = undefined;
       this.available = false;
       this.nextRestartAllowedAt = 0;
+      this.playbackEndsAt = 0;
     }
   }
 }
