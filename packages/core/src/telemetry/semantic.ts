@@ -351,8 +351,12 @@ function toOTelFinishReason(finishReason?: string): OTelFinishReason {
       return OTelFinishReason.ERROR;
     case FinishReason.IMAGE_SAFETY:
       return OTelFinishReason.CONTENT_FILTER;
+    case FinishReason.IMAGE_RECITATION:
+      return OTelFinishReason.CONTENT_FILTER;
     case FinishReason.UNEXPECTED_TOOL_CALL:
       return OTelFinishReason.ERROR;
+    case FinishReason.IMAGE_OTHER:
+      return OTelFinishReason.STOP;
     default:
       return OTelFinishReason.STOP;
   }
