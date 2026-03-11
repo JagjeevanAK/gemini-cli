@@ -10,7 +10,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { audioEngine, type AudioState } from '../../services/audioEngine.js';
 import { theme } from '../semantic-colors.js';
 import { ThemedGradient } from './ThemedGradient.js';
-import { GeminiSpinner } from './GeminiRespondingSpinner.js';
+import { GeminiSpinner } from './GeminiSpinner.js';
 import { useKeypress } from '../hooks/useKeypress.js';
 import { KeypressPriority } from '../contexts/KeypressContext.js';
 import { useOptionalVoiceAssistant } from '../contexts/VoiceAssistantContext.js';
