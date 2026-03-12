@@ -250,8 +250,147 @@ describe('useVoiceAssistantController', () => {
     expect(
       voiceAssistantTestMocks.liveVoiceSession.sendTextTurn,
     ).toHaveBeenCalledWith(
-      expect.stringContaining('Notification: Queued follow up'),
+      expect.stringContaining('<plan_text>\nQueued follow up\n</plan_text>'),
     );
+
+    unmount();
+  });
+
+  it('uses an exact notification prompt for approval announcements', async () => {
+    let resolveStart: ((model: string) => void) | undefined;
+    voiceAssistantTestMocks.liveVoiceSession.start.mockImplementation(
+      () =>
+        new Promise((resolve: (model: string) => void) => {
+          resolveStart = resolve;
+        }),
+    );
+    const params = {
+      config: {} as Config,
+      enabled: true,
+      captureAudio: false,
+      runtimeConfig: {},
+      isAgentBusy: () => false,
+      onDisableRequested: vi.fn(),
+      getRuntimeStatus: () => 'idle',
+      getLatestHistoryId: () => 0,
+      getPendingActions: () => [],
+      submitUserRequest: vi.fn(async () => undefined),
+      submitUserHint: vi.fn(),
+      resolvePendingAction: vi.fn(async () => ''),
+      cancelCurrentRun: vi.fn(),
+    };
+
+    const { result, waitUntilReady, unmount } = renderHook(() =>
+      useVoiceAssistantController(params),
+    );
+
+    await waitUntilReady();
+
+    await act(async () => {
+      resolveStart?.('gemini-live-test');
+      await Promise.resolve();
+    });
+
+    act(() => {
+      expect(
+        result.current.speak(
+          'Approval required. I need permission to run "git status". Say "allow once", "allow for this session", "always allow", or "cancel".',
+        ),
+      ).toBe(true);
+    });
+
+    expect(
+      voiceAssistantTestMocks.liveVoiceSession.sendTextTurn,
+    ).toHaveBeenCalledWith(
+      expect.stringContaining('Critical controller plan/update text.'),
+    );
+    expect(
+      voiceAssistantTestMocks.liveVoiceSession.sendTextTurn,
+    ).toHaveBeenCalledWith(
+      expect.stringContaining(
+        'Preserve commands, quoted text, file names, and every listed option exactly and in the same order.',
+      ),
+    );
+    expect(
+      voiceAssistantTestMocks.liveVoiceSession.sendTextTurn,
+    ).toHaveBeenCalledWith(expect.stringContaining('<plan_text>'));
+    expect(
+      voiceAssistantTestMocks.liveVoiceSession.sendTextTurn,
+    ).toHaveBeenCalledWith(expect.stringContaining('"git status"'));
+
+    unmount();
+  });
+
+  it('strips a leaked notification label from streamed notification output', async () => {
+    let resolveStart: ((model: string) => void) | undefined;
+    voiceAssistantTestMocks.liveVoiceSession.start.mockImplementation(
+      () =>
+        new Promise((resolve: (model: string) => void) => {
+          resolveStart = resolve;
+        }),
+    );
+    const params = {
+      config: {} as Config,
+      enabled: true,
+      captureAudio: false,
+      runtimeConfig: {},
+      isAgentBusy: () => false,
+      onDisableRequested: vi.fn(),
+      getRuntimeStatus: () => 'idle',
+      getLatestHistoryId: () => 11,
+      getPendingActions: () => [],
+      submitUserRequest: vi.fn(async () => undefined),
+      submitUserHint: vi.fn(),
+      resolvePendingAction: vi.fn(async () => ''),
+      cancelCurrentRun: vi.fn(),
+    };
+
+    const { result, waitUntilReady, unmount } = renderHook(() =>
+      useVoiceAssistantController(params),
+    );
+
+    await waitUntilReady();
+
+    const session = voiceAssistantTestMocks.liveVoiceSession.instances[0];
+    if (!session) {
+      throw new Error('Expected a live voice session instance.');
+    }
+
+    await act(async () => {
+      resolveStart?.('gemini-live-test');
+      await Promise.resolve();
+    });
+
+    act(() => {
+      expect(
+        result.current.speak(
+          'Approval required. I need permission to run "git status". Say "allow once", "allow for this session", "always allow", or "cancel".',
+        ),
+      ).toBe(true);
+    });
+
+    await act(async () => {
+      session.emit(
+        'outputTranscript',
+        'Notification: Approval required. Say "allow once" or "cancel".',
+      );
+    });
+
+    expect(result.current.outputTranscript).toBe(
+      'Approval required. Say "allow once" or "cancel".',
+    );
+
+    await act(async () => {
+      session.emit('turnComplete', null);
+    });
+
+    expect(result.current.outputHistory).toEqual([
+      {
+        id: 1,
+        anchorHistoryId: 11,
+        text: 'Approval required. Say "allow once" or "cancel".',
+      },
+    ]);
 
     unmount();
   });
@@ -394,8 +533,314 @@ describe('useVoiceAssistantController', () => {
 
       expect(
         voiceAssistantTestMocks.liveVoiceSession.sendTextTurn,
+      ).not.toHaveBeenCalled();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+
+      expect(
+        voiceAssistantTestMocks.liveVoiceSession.sendTextTurn,
       ).toHaveBeenCalledWith(
-        expect.stringContaining('Notification: Next sentence'),
+        expect.stringContaining('<plan_text>\nNext sentence\n</plan_text>'),
+      );
+
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('blocks mic uplink and client turn commits while assistant playback is active', async () => {
+    let resolveStart: ((model: string) => void) | undefined;
+    let pcmHandler: ((pcmBytes: Buffer) => void) | undefined;
+    let audioStateHandler: ((audioState: MockAudioState) => void) | undefined;
+    voiceAssistantTestMocks.liveVoiceSession.start.mockImplementation(
+      () =>
+        new Promise((resolve: (model: string) => void) => {
+          resolveStart = resolve;
+        }),
+    );
+    voiceAssistantTestMocks.audioEngine.subscribePcm.mockImplementation(
+      (handler: (pcmBytes: Buffer) => void) => {
+        pcmHandler = handler;
+        return () => {};
+      },
+    );
+    voiceAssistantTestMocks.audioEngine.subscribe.mockImplementation(
+      (handler: (audioState: MockAudioState) => void) => {
+        audioStateHandler = handler;
+        return () => {};
+      },
+    );
+    let pendingPlaybackMs = 0;
+    voiceAssistantTestMocks.audioPlayback.playChunk.mockImplementation(() => {
+      pendingPlaybackMs = 1400;
+    });
+    voiceAssistantTestMocks.audioPlayback.getPendingPlaybackMs.mockImplementation(
+      () => pendingPlaybackMs,
+    );
+
+    const params = {
+      config: {} as Config,
+      enabled: true,
+      captureAudio: true,
+      runtimeConfig: {},
+      isAgentBusy: () => false,
+      onDisableRequested: vi.fn(),
+      getRuntimeStatus: () => 'idle',
+      getLatestHistoryId: () => 0,
+      getPendingActions: () => [],
+      submitUserRequest: vi.fn(async () => undefined),
+      submitUserHint: vi.fn(),
+      resolvePendingAction: vi.fn(async () => ''),
+      cancelCurrentRun: vi.fn(),
+    };
+
+    const { waitUntilReady, unmount } = renderHook(() =>
+      useVoiceAssistantController(params),
+    );
+
+    await waitUntilReady();
+
+    const session = voiceAssistantTestMocks.liveVoiceSession.instances[0];
+    if (!session) {
+      throw new Error('Expected a live voice session instance.');
+    }
+    if (!pcmHandler) {
+      throw new Error('Expected PCM handler to be subscribed.');
+    }
+    if (!audioStateHandler) {
+      throw new Error('Expected audio state handler to be subscribed.');
+    }
+
+    await act(async () => {
+      resolveStart?.('gemini-live-test');
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      session.emit('outputAudioChunk', {
+        chunk: Buffer.from([0, 1, 2, 3]),
+        mimeType: 'audio/pcm;rate=24000',
+      });
+    });
+
+    expect(
+      voiceAssistantTestMocks.liveVoiceSession.sendAudioStreamEnd,
+    ).toHaveBeenCalledWith('assistant_playback_guard');
+
+    voiceAssistantTestMocks.liveVoiceSession.sendAudioChunk.mockClear();
+    voiceAssistantTestMocks.liveVoiceSession.sendAudioStreamEnd.mockClear();
+
+    await act(async () => {
+      pcmHandler?.(Buffer.from([9, 9, 9, 9]));
+      audioStateHandler?.({
+        rms: 0,
+        smoothedRms: 0,
+        level: 0,
+        probability: 0,
+        isTalking: true,
+        timestamp: Date.now(),
+        error: null,
+        permissionRequired: false,
+      });
+      audioStateHandler?.({
+        rms: 0,
+        smoothedRms: 0,
+        level: 0,
+        probability: 0,
+        isTalking: false,
+        timestamp: Date.now(),
+        error: null,
+        permissionRequired: false,
+      });
+      await Promise.resolve();
+    });
+
+    expect(
+      voiceAssistantTestMocks.liveVoiceSession.sendAudioChunk,
+    ).not.toHaveBeenCalled();
+    expect(
+      voiceAssistantTestMocks.liveVoiceSession.sendAudioStreamEnd,
+    ).not.toHaveBeenCalled();
+
+    unmount();
+  });
+
+  it('ignores input transcripts that arrive during assistant playback guard', async () => {
+    let resolveStart: ((model: string) => void) | undefined;
+    voiceAssistantTestMocks.liveVoiceSession.start.mockImplementation(
+      () =>
+        new Promise((resolve: (model: string) => void) => {
+          resolveStart = resolve;
+        }),
+    );
+    let pendingPlaybackMs = 0;
+    voiceAssistantTestMocks.audioPlayback.playChunk.mockImplementation(() => {
+      pendingPlaybackMs = 1400;
+    });
+    voiceAssistantTestMocks.audioPlayback.getPendingPlaybackMs.mockImplementation(
+      () => pendingPlaybackMs,
+    );
+    const submitUserRequest = vi.fn(async () => undefined);
+    const resolvePendingAction = vi.fn(async () => 'Approved.');
+    const params = {
+      config: {} as Config,
+      enabled: true,
+      captureAudio: true,
+      runtimeConfig: {},
+      isAgentBusy: () => false,
+      onDisableRequested: vi.fn(),
+      getRuntimeStatus: () => 'idle',
+      getLatestHistoryId: () => 0,
+      getPendingActions: () => [
+        {
+          id: 'tool:1',
+          type: 'tool' as const,
+          title: 'Run git status',
+          detail: 'Run git status',
+          allowedDecisions: [
+            'allow_once',
+            'allow_session',
+            'allow_always',
+            'cancel',
+          ],
+        },
+      ],
+      submitUserRequest,
+      submitUserHint: vi.fn(),
+      resolvePendingAction,
+      cancelCurrentRun: vi.fn(),
+    };
+
+    const { result, waitUntilReady, unmount } = renderHook(() =>
+      useVoiceAssistantController(params),
+    );
+
+    await waitUntilReady();
+
+    const session = voiceAssistantTestMocks.liveVoiceSession.instances[0];
+    if (!session) {
+      throw new Error('Expected a live voice session instance.');
+    }
+
+    await act(async () => {
+      resolveStart?.('gemini-live-test');
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      session.emit('outputAudioChunk', {
+        chunk: Buffer.from([0, 1, 2, 3]),
+        mimeType: 'audio/pcm;rate=24000',
+      });
+      session.emit('inputTranscript', 'allow once');
+      await Promise.resolve();
+    });
+
+    expect(resolvePendingAction).not.toHaveBeenCalled();
+    expect(submitUserRequest).not.toHaveBeenCalled();
+    expect(result.current.inputTranscript).toBe('');
+
+    unmount();
+  });
+
+  it('preserves the current utterance across push-to-talk release while final transcripts are still arriving', async () => {
+    vi.useFakeTimers();
+    let resolveStart: ((model: string) => void) | undefined;
+    let audioStateHandler: ((audioState: MockAudioState) => void) | undefined;
+    voiceAssistantTestMocks.liveVoiceSession.start.mockImplementation(
+      () =>
+        new Promise((resolve: (model: string) => void) => {
+          resolveStart = resolve;
+        }),
+    );
+    voiceAssistantTestMocks.audioEngine.subscribe.mockImplementation(
+      (handler: (audioState: MockAudioState) => void) => {
+        audioStateHandler = handler;
+        return () => {};
+      },
+    );
+    const submitUserRequest = vi.fn(async () => undefined);
+
+    const params = {
+      config: {} as Config,
+      enabled: true,
+      captureAudio: true,
+      runtimeConfig: {},
+      isAgentBusy: () => false,
+      onDisableRequested: vi.fn(),
+      getRuntimeStatus: () => 'idle',
+      getLatestHistoryId: () => 0,
+      getPendingActions: () => [],
+      submitUserRequest,
+      submitUserHint: vi.fn(),
+      resolvePendingAction: vi.fn(async () => ''),
+      cancelCurrentRun: vi.fn(),
+    };
+
+    try {
+      const { result, rerender, waitUntilReady, unmount } = renderHook(
+        (props: typeof params) => useVoiceAssistantController(props),
+        { initialProps: params },
+      );
+
+      await waitUntilReady();
+
+      const session = voiceAssistantTestMocks.liveVoiceSession.instances[0];
+      if (!session) {
+        throw new Error('Expected a live voice session instance.');
+      }
+      if (!audioStateHandler) {
+        throw new Error('Expected audio state handler to be subscribed.');
+      }
+
+      await act(async () => {
+        resolveStart?.('gemini-live-test');
+        await Promise.resolve();
+      });
+
+      await act(async () => {
+        session.emit('inputTranscript', 'Hey can you tell me what');
+      });
+      expect(result.current.inputTranscript).toContain(
+        'Hey can you tell me what',
+      );
+
+      rerender({
+        ...params,
+        captureAudio: false,
+      });
+
+      await act(async () => {
+        audioStateHandler?.({
+          rms: 0,
+          smoothedRms: 0,
+          level: 0,
+          probability: 0,
+          isTalking: false,
+          timestamp: Date.now(),
+          error: null,
+          permissionRequired: false,
+        });
+        session.emit(
+          'inputTranscript',
+          ' are the uncommitted files in this code base?',
+        );
+        await Promise.resolve();
+      });
+
+      expect(result.current.inputTranscript).toContain(
+        'Hey can you tell me what are the uncommitted files in this code base?',
+      );
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1005);
+      });
+
+      expect(submitUserRequest).toHaveBeenCalledWith(
+        'Hey can you tell me what are the uncommitted files in this code base?',
       );
 
       unmount();
@@ -493,7 +938,7 @@ describe('useVoiceAssistantController', () => {
     unmount();
   });
 
-  it('submits non-Latin request transcripts directly without speaking a redundant handoff ack', async () => {
+  it('routes non-Latin request transcripts through the interpreter before submission', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-03-11T15:30:00.000Z'));
     let resolveStart: ((model: string) => void) | undefined;
@@ -503,9 +948,7 @@ describe('useVoiceAssistantController', () => {
           resolveStart = resolve;
         }),
     );
-    const submitUserRequest = vi.fn(
-      async () => "On it. I'll check that and report back.",
-    );
+    const submitUserRequest = vi.fn(async () => undefined);
 
     const params = {
       config: {} as Config,
@@ -548,12 +991,125 @@ describe('useVoiceAssistantController', () => {
         await vi.advanceTimersByTimeAsync(1005);
       });
 
-      expect(submitUserRequest).toHaveBeenCalledWith(
-        'हे कैन यू टेल मी व्हाट आर द अन कमिटेड फाइल्स इन द कोड बेस',
-      );
+      expect(submitUserRequest).not.toHaveBeenCalled();
       expect(
         voiceAssistantTestMocks.liveVoiceSession.sendTextTurn,
-      ).not.toHaveBeenCalled();
+      ).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'For submit_user_request and submit_user_hint, set "canonicalUserText" to the natural user-facing wording of what the user actually said.',
+        ),
+      );
+
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('uses canonicalUserText from interpreter tool calls to correct the visible transcript and submitted request', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-03-11T15:30:30.000Z'));
+    let resolveStart: ((model: string) => void) | undefined;
+    let resolveSubmit:
+      | ((value: string | undefined | PromiseLike<string | undefined>) => void)
+      | undefined;
+    voiceAssistantTestMocks.liveVoiceSession.start.mockImplementation(
+      () =>
+        new Promise((resolve: (model: string) => void) => {
+          resolveStart = resolve;
+        }),
+    );
+    const submitUserRequest = vi.fn(
+      () =>
+        new Promise<string | undefined>((resolve) => {
+          resolveSubmit = resolve;
+        }),
+    );
+
+    const params = {
+      config: {} as Config,
+      enabled: true,
+      captureAudio: false,
+      runtimeConfig: {},
+      isAgentBusy: () => false,
+      onDisableRequested: vi.fn(),
+      getRuntimeStatus: () => 'idle',
+      getLatestHistoryId: () => 0,
+      getPendingActions: () => [],
+      submitUserRequest,
+      submitUserHint: vi.fn(),
+      resolvePendingAction: vi.fn(async () => ''),
+      cancelCurrentRun: vi.fn(),
+    };
+
+    try {
+      const { result, waitUntilReady, unmount } = renderHook(() =>
+        useVoiceAssistantController(params),
+      );
+
+      await waitUntilReady();
+
+      const session = voiceAssistantTestMocks.liveVoiceSession.instances[0];
+      if (!session) {
+        throw new Error('Expected a live voice session instance.');
+      }
+
+      await act(async () => {
+        resolveStart?.('gemini-live-test');
+        await Promise.resolve();
+      });
+
+      await act(async () => {
+        session.emit(
+          'inputTranscript',
+          'हे कैन यू टेल मी व्हाट आर द अन कमिटेड फाइल्स इन द कोड बेस',
+        );
+        await vi.advanceTimersByTimeAsync(1005);
+      });
+
+      await act(async () => {
+        session.emit('toolCall', [
+          {
+            id: 'submit-1',
+            name: 'submit_user_request',
+            args: {
+              text: 'Can you tell me what the uncommitted files are in the codebase?',
+              canonicalUserText:
+                'Can you tell me what the uncommitted files are in the codebase?',
+            },
+          },
+        ]);
+        await Promise.resolve();
+      });
+
+      expect(submitUserRequest).toHaveBeenCalledWith(
+        'Can you tell me what the uncommitted files are in the codebase?',
+      );
+      expect(result.current.inputTranscript).toBe(
+        'Can you tell me what the uncommitted files are in the codebase?',
+      );
+
+      await act(async () => {
+        resolveSubmit?.('On it. I will check that.');
+        await Promise.resolve();
+      });
+
+      expect(
+        voiceAssistantTestMocks.liveVoiceSession.sendToolResponses,
+      ).toHaveBeenCalledWith([
+        {
+          id: 'submit-1',
+          name: 'submit_user_request',
+          response: {
+            ok: true,
+            submittedText:
+              'Can you tell me what the uncommitted files are in the codebase?',
+            canonicalUserText:
+              'Can you tell me what the uncommitted files are in the codebase?',
+            message: 'On it. I will check that.',
+          },
+        },
+      ]);
 
       unmount();
     } finally {
@@ -654,6 +1210,225 @@ describe('useVoiceAssistantController', () => {
         actionId: 'tool:1',
         decision: 'allow_once',
       });
+
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears pending approval flow after session-level approval without re-speaking the approval ack', async () => {
+    let resolveStart: ((model: string) => void) | undefined;
+    voiceAssistantTestMocks.liveVoiceSession.start.mockImplementation(
+      () =>
+        new Promise((resolve: (model: string) => void) => {
+          resolveStart = resolve;
+        }),
+    );
+    let pendingActions = [
+      {
+        id: 'tool:1',
+        type: 'tool' as const,
+        title: 'Run git status',
+        detail: 'Run git status',
+        allowedDecisions: [
+          'allow_once',
+          'allow_session',
+          'allow_always',
+          'cancel',
+        ],
+      },
+    ];
+    const resolvePendingAction = vi.fn(
+      async ({ decision }: { decision: string }) => {
+        if (decision === 'allow_session') {
+          pendingActions = [];
+          return 'Okay, approved for this session.';
+        }
+        return 'I could not resolve that tool action.';
+      },
+    );
+
+    const params = {
+      config: {} as Config,
+      enabled: true,
+      captureAudio: false,
+      runtimeConfig: {},
+      isAgentBusy: () => false,
+      onDisableRequested: vi.fn(),
+      getRuntimeStatus: () => 'idle',
+      getLatestHistoryId: () => 0,
+      getPendingActions: () => pendingActions,
+      submitUserRequest: vi.fn(async () => undefined),
+      submitUserHint: vi.fn(),
+      resolvePendingAction,
+      cancelCurrentRun: vi.fn(),
+    };
+
+    const { result, waitUntilReady, unmount } = renderHook(() =>
+      useVoiceAssistantController(params),
+    );
+
+    await waitUntilReady();
+
+    const session = voiceAssistantTestMocks.liveVoiceSession.instances[0];
+    if (!session) {
+      throw new Error('Expected a live voice session instance.');
+    }
+
+    await act(async () => {
+      resolveStart?.('gemini-live-test');
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      session.emit('inputTranscript', 'allow for this session');
+      await Promise.resolve();
+    });
+
+    expect(resolvePendingAction).toHaveBeenCalledWith({
+      actionId: 'tool:1',
+      decision: 'allow_session',
+    });
+    expect(
+      voiceAssistantTestMocks.liveVoiceSession.sendTextTurn,
+    ).not.toHaveBeenCalled();
+    expect(result.current.outputHistory).toEqual([
+      {
+        id: 1,
+        anchorHistoryId: 0,
+        text: 'Okay, approved for this session.',
+      },
+    ]);
+
+    await act(async () => {
+      session.emit('outputTranscript', 'Done.');
+      await Promise.resolve();
+    });
+
+    expect(result.current.outputTranscript).toBe('Done.');
+
+    unmount();
+  });
+
+  it('ignores resolve_pending_action calls when no pending actions remain', async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveStart: ((model: string) => void) | undefined;
+      voiceAssistantTestMocks.liveVoiceSession.start.mockImplementation(
+        () =>
+          new Promise((resolve: (model: string) => void) => {
+            resolveStart = resolve;
+          }),
+      );
+      let pendingActions = [
+        {
+          id: 'tool:1',
+          type: 'tool' as const,
+          title: 'Run git log',
+          detail: 'Run git log',
+          allowedDecisions: [
+            'allow_once',
+            'allow_session',
+            'allow_always',
+            'cancel',
+          ],
+        },
+      ];
+      const resolvePendingAction = vi.fn(
+        async ({ decision }: { decision: string }) => {
+          if (decision === 'allow_session') {
+            pendingActions = [];
+            return 'Okay, approved for this session.';
+          }
+          return 'I could not resolve that tool action.';
+        },
+      );
+
+      const params = {
+        config: {} as Config,
+        enabled: true,
+        captureAudio: false,
+        runtimeConfig: {},
+        isAgentBusy: () => false,
+        onDisableRequested: vi.fn(),
+        getRuntimeStatus: () => 'idle',
+        getLatestHistoryId: () => 0,
+        getPendingActions: () => pendingActions,
+        submitUserRequest: vi.fn(async () => undefined),
+        submitUserHint: vi.fn(),
+        resolvePendingAction,
+        cancelCurrentRun: vi.fn(),
+      };
+
+      const { result, waitUntilReady, unmount } = renderHook(() =>
+        useVoiceAssistantController(params),
+      );
+
+      await waitUntilReady();
+
+      const session = voiceAssistantTestMocks.liveVoiceSession.instances[0];
+      if (!session) {
+        throw new Error('Expected a live voice session instance.');
+      }
+
+      await act(async () => {
+        resolveStart?.('gemini-live-test');
+        await Promise.resolve();
+      });
+
+      await act(async () => {
+        session.emit('inputTranscript', 'allow for this session');
+        await Promise.resolve();
+      });
+
+      expect(resolvePendingAction).toHaveBeenCalledWith({
+        actionId: 'tool:1',
+        decision: 'allow_session',
+      });
+      voiceAssistantTestMocks.liveVoiceSession.sendToolResponses.mockClear();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2500);
+      });
+
+      await act(async () => {
+        session.emit('outputTranscript', 'Let me check');
+        session.emit('toolCall', [
+          {
+            id: 'dup-resolve',
+            name: 'resolve_pending_action',
+            args: {
+              decision: 'allow_session',
+            },
+          },
+        ]);
+        session.emit('turnComplete', null);
+        await Promise.resolve();
+      });
+
+      expect(result.current.outputTranscript).toBe('');
+      expect(result.current.outputHistory).toEqual([
+        {
+          id: 1,
+          anchorHistoryId: 0,
+          text: 'Okay, approved for this session.',
+        },
+      ]);
+      expect(
+        voiceAssistantTestMocks.liveVoiceSession.sendToolResponses,
+      ).toHaveBeenCalledWith([
+        {
+          id: 'dup-resolve',
+          name: 'resolve_pending_action',
+          response: {
+            ok: true,
+            deduped: true,
+            ignored: true,
+            message: '',
+          },
+        },
+      ]);
 
       unmount();
     } finally {
