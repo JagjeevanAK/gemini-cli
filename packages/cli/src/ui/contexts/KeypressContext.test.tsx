@@ -186,6 +186,82 @@ describe('KeypressContext', () => {
     });
   });
 
+  describe('Kitty key event phases', () => {
+    it.each([
+      {
+        sequence: '\x1b[103;9;1u',
+        expectedPhase: 'press' as const,
+      },
+      {
+        sequence: '\x1b[103;9;2u',
+        expectedPhase: 'repeat' as const,
+      },
+      {
+        sequence: '\x1b[103;9;3u',
+        expectedPhase: 'release' as const,
+      },
+      {
+        sequence: '\x1b[103;9:1u',
+        expectedPhase: 'press' as const,
+      },
+      {
+        sequence: '\x1b[103;9:2u',
+        expectedPhase: 'repeat' as const,
+      },
+      {
+        sequence: '\x1b[103;9:3u',
+        expectedPhase: 'release' as const,
+      },
+    ])(
+      'should parse kitty key event phase $expectedPhase for Cmd+g',
+      async ({ sequence, expectedPhase }) => {
+        const { keyHandler } = setupKeypressTest();
+
+        // CSI u format: ESC [ keyCode ; modifier ; eventType u
+        // or ESC [ keyCode ; modifier:eventType u
+        // keyCode 103 = "g", modifier 9 = Cmd.
+        act(() => stdin.write(sequence));
+
+        expect(keyHandler).toHaveBeenCalledWith(
+          expect.objectContaining({
+            name: 'g',
+            cmd: true,
+            ctrl: false,
+            alt: false,
+            phase: expectedPhase,
+          }),
+        );
+      },
+    );
+  });
+
+  describe('Kitty event-typed arrows', () => {
+    it('should parse kitty up-arrow press with event type', async () => {
+      const { keyHandler } = setupKeypressTest();
+
+      // CSI 1 ; modifier:eventType A
+      act(() => stdin.write('\x1b[1;1:1A'));
+
+      expect(keyHandler).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'up',
+          ctrl: false,
+          alt: false,
+          cmd: false,
+        }),
+      );
+    });
+
+    it('should suppress non-Cmd+G release events', async () => {
+      const { keyHandler } = setupKeypressTest();
+
+      // Up-arrow release event.
+      act(() => stdin.write('\x1b[1;1:3A'));
+
+      expect(keyHandler).not.toHaveBeenCalled();
+    });
+  });
+
   describe('Fast return buffering', () => {
     let kittySpy: ReturnType<typeof vi.spyOn>;
 

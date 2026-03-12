@@ -19,6 +19,8 @@ import { useMemo, memo, useCallback, useEffect, useRef } from 'react';
 import { MAX_GEMINI_MESSAGE_LINES } from '../constants.js';
 import { useConfirmingTool } from '../hooks/useConfirmingTool.js';
 import { ToolConfirmationQueue } from './ToolConfirmationQueue.js';
+import { useOptionalVoiceAssistant } from '../contexts/VoiceAssistantContext.js';
+import type { HistoryItem } from '../types.js';
 
 const MemoizedHistoryItemDisplay = memo(HistoryItemDisplay);
 const MemoizedAppHeader = memo(AppHeader);
@@ -31,10 +33,15 @@ export const MainContent = () => {
   const { version } = useAppContext();
   const uiState = useUIState();
   const isAlternateBuffer = useAlternateBuffer();
+  const voiceAssistant = useOptionalVoiceAssistant();
 
   const confirmingTool = useConfirmingTool();
   const showConfirmationQueue = confirmingTool !== null;
   const confirmingToolCallId = confirmingTool?.tool.callId;
+  const liveVoiceAssistantOutput =
+    voiceAssistant?.enabled && voiceAssistant.outputTranscript.trim().length > 0
+      ? voiceAssistant.outputTranscript.trim()
+      : null;
 
   const scrollableListRef = useRef<VirtualizedListRef<unknown>>(null);
 
@@ -52,22 +59,90 @@ export const MainContent = () => {
   } = uiState;
   const showHeaderDetails = cleanUiDetailsVisible;
 
+  const combinedHistoryItems = useMemo<HistoryItem[]>(() => {
+    const voiceOutputs = voiceAssistant?.outputHistory ?? [];
+    if (voiceOutputs.length === 0) {
+      return uiState.history;
+    }
+
+    const mergedHistory: HistoryItem[] = [];
+    const insertedVoiceAnchors = new Set<number>();
+    const voiceOutputsByAnchor = new Map<
+      number,
+      {
+        id: number;
+        text: string;
+      }
+    >();
+
+    for (const output of voiceOutputs) {
+      const trimmedText = output.text.trim();
+      if (!trimmedText) {
+        continue;
+      }
+
+      const existing = voiceOutputsByAnchor.get(output.anchorHistoryId);
+      if (!existing) {
+        voiceOutputsByAnchor.set(output.anchorHistoryId, {
+          id: output.id,
+          text: trimmedText,
+        });
+        continue;
+      }
+
+      existing.text = `${existing.text}\n${trimmedText}`.trim();
+    }
+
+    const appendVoiceOutputs = (anchorHistoryId: number) => {
+      const anchoredOutput = voiceOutputsByAnchor.get(anchorHistoryId);
+      if (!anchoredOutput) {
+        return;
+      }
+
+      insertedVoiceAnchors.add(anchorHistoryId);
+      mergedHistory.push({
+        id: -anchoredOutput.id,
+        type: 'gemini',
+        text: anchoredOutput.text,
+      });
+    };
+
+    appendVoiceOutputs(0);
+    for (const item of uiState.history) {
+      mergedHistory.push(item);
+      appendVoiceOutputs(item.id);
+    }
+
+    for (const [anchorHistoryId, output] of voiceOutputsByAnchor.entries()) {
+      if (insertedVoiceAnchors.has(anchorHistoryId)) {
+        continue;
+      }
+      mergedHistory.push({
+        id: -output.id,
+        type: 'gemini',
+        text: output.text,
+      });
+    }
+
+    return mergedHistory;
+  }, [uiState.history, voiceAssistant?.outputHistory]);
+
   const lastUserPromptIndex = useMemo(() => {
-    for (let i = uiState.history.length - 1; i >= 0; i--) {
-      const type = uiState.history[i].type;
+    for (let i = combinedHistoryItems.length - 1; i >= 0; i--) {
+      const type = combinedHistoryItems[i].type;
       if (type === 'user' || type === 'user_shell') {
         return i;
       }
     }
     return -1;
-  }, [uiState.history]);
+  }, [combinedHistoryItems]);
 
   const augmentedHistory = useMemo(
     () =>
-      uiState.history.map((item, index) => {
+      combinedHistoryItems.map((item, index) => {
         const isExpandable = index > lastUserPromptIndex;
         const prevType =
-          index > 0 ? uiState.history[index - 1]?.type : undefined;
+          index > 0 ? combinedHistoryItems[index - 1]?.type : undefined;
         const isFirstThinking =
           item.type === 'thinking' && prevType !== 'thinking';
         const isFirstAfterThinking =
@@ -80,7 +155,7 @@ export const MainContent = () => {
           isFirstAfterThinking,
         };
       }),
-    [uiState.history, lastUserPromptIndex],
+    [combinedHistoryItems, lastUserPromptIndex],
   );
 
   const historyItems = useMemo(
@@ -130,7 +205,7 @@ export const MainContent = () => {
         {pendingHistoryItems.map((item, i) => {
           const prevType =
             i === 0
-              ? uiState.history.at(-1)?.type
+              ? combinedHistoryItems.at(-1)?.type
               : pendingHistoryItems[i - 1]?.type;
           const isFirstThinking =
             item.type === 'thinking' && prevType !== 'thinking';
@@ -155,6 +230,18 @@ export const MainContent = () => {
         {showConfirmationQueue && confirmingTool && (
           <ToolConfirmationQueue confirmingTool={confirmingTool} />
         )}
+        {liveVoiceAssistantOutput && (
+          <HistoryItemDisplay
+            key="voice-assistant-live-output"
+            availableTerminalHeight={
+              uiState.constrainHeight ? staticAreaMaxItemHeight : undefined
+            }
+            terminalWidth={mainAreaWidth}
+            item={{ id: 0, type: 'gemini', text: liveVoiceAssistantOutput }}
+            isPending={false}
+            isExpandable={true}
+          />
+        )}
       </Box>
     ),
     [
@@ -164,7 +251,8 @@ export const MainContent = () => {
       mainAreaWidth,
       showConfirmationQueue,
       confirmingTool,
-      uiState.history,
+      liveVoiceAssistantOutput,
+      combinedHistoryItems,
     ],
   );
 

@@ -18,6 +18,10 @@ import {
   useUIState,
   type UIState,
 } from '../contexts/UIStateContext.js';
+import {
+  VoiceAssistantContextProvider,
+  type VoiceAssistantContextValue,
+} from '../contexts/VoiceAssistantContext.js';
 import { CoreToolCallStatus } from '@google/gemini-cli-core';
 import { type IndividualToolCallDisplay } from '../types.js';
 
@@ -78,6 +82,26 @@ vi.mock('./shared/ScrollableList.js', () => ({
 
 import { theme } from '../semantic-colors.js';
 import { type BackgroundShell } from '../hooks/shellReducer.js';
+
+const baseVoiceAssistantValue: VoiceAssistantContextValue = {
+  enabled: true,
+  listening: false,
+  connectionState: 'connected',
+  inputTranscript: '',
+  outputTranscript: '',
+  outputHistory: [],
+  assistantSpeaking: false,
+  outputLevel: 0,
+  model: null,
+  error: null,
+  playbackWarning: null,
+  enable: vi.fn(),
+  toggle: vi.fn(),
+  disable: vi.fn(),
+  setListening: vi.fn(),
+  speak: vi.fn(() => true),
+  lastOutputAt: 0,
+};
 
 describe('getToolGroupBorderAppearance', () => {
   const mockBackgroundShells = new Map<number, BackgroundShell>();
@@ -756,5 +780,94 @@ describe('MainContent', () => {
         unmount();
       },
     );
+  });
+
+  it('renders committed and live voice output through Gemini-style messages', async () => {
+    vi.mocked(useAlternateBuffer).mockReturnValue(false);
+
+    const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
+      <VoiceAssistantContextProvider
+        value={{
+          ...baseVoiceAssistantValue,
+          outputHistory: [
+            { id: 1, anchorHistoryId: 1, text: 'Completed reply one' },
+            { id: 2, anchorHistoryId: 2, text: 'Completed reply two' },
+          ],
+          outputTranscript: 'Live reply line 1\nLive reply line 2',
+        }}
+      >
+        <MainContent />
+      </VoiceAssistantContextProvider>,
+      {
+        uiState: {
+          ...defaultMockUiState,
+          history: [
+            { id: 1, type: 'user', text: 'Check the repo status' },
+            { id: 2, type: 'gemini', text: 'Coding agent reply' },
+          ],
+          historyRemountKey: 0,
+          pendingHistoryItems: [],
+        } as Partial<UIState>,
+        useAlternateBuffer: false,
+      },
+    );
+
+    await waitUntilReady();
+
+    const output = lastFrame();
+    expect(output).toContain('Completed reply one');
+    expect(output).toContain('Completed reply two');
+    expect(output).toContain('Live reply line 1');
+    expect(output).toContain('Live reply line 2');
+    expect(output.indexOf('Completed reply one')).toBeGreaterThan(
+      output.indexOf('Check the repo status'),
+    );
+    expect(output.indexOf('Completed reply one')).toBeLessThan(
+      output.indexOf('Coding agent reply'),
+    );
+    expect(output.match(/✦/g)?.length ?? 0).toBeGreaterThanOrEqual(3);
+
+    unmount();
+  });
+
+  it('groups committed voice outputs under a single Gemini marker for the same anchor turn', async () => {
+    vi.mocked(useAlternateBuffer).mockReturnValue(false);
+
+    const { lastFrame, unmount } = renderWithProviders(
+      <VoiceAssistantContextProvider
+        value={{
+          ...baseVoiceAssistantValue,
+          outputHistory: [
+            { id: 1, anchorHistoryId: 2, text: 'Voice line one' },
+            { id: 2, anchorHistoryId: 2, text: 'Voice line two' },
+          ],
+        }}
+      >
+        <MainContent />
+      </VoiceAssistantContextProvider>,
+      {
+        uiState: {
+          ...defaultMockUiState,
+          history: [
+            { id: 1, type: 'user', text: 'Check the repo status' },
+            { id: 2, type: 'gemini', text: 'Coding agent reply' },
+          ],
+          historyRemountKey: 0,
+          pendingHistoryItems: [],
+        } as Partial<UIState>,
+        useAlternateBuffer: false,
+      },
+    );
+
+    await waitFor(() => {
+      expect(lastFrame()).toContain('Voice line two');
+    });
+
+    const output = lastFrame();
+    expect(output).toContain('Voice line one');
+    expect(output).toContain('Voice line two');
+    expect(output.match(/✦/g)?.length ?? 0).toBe(2);
+
+    unmount();
   });
 });

@@ -29,7 +29,7 @@ describe('Model Steering Integration', () => {
       configOverrides: { modelSteering: true },
     });
     await rig.initialize();
-    rig.render();
+    await rig.render();
     await rig.waitForIdle();
 
     rig.setToolPolicy('list_directory', PolicyDecision.ASK_USER);
@@ -56,23 +56,24 @@ describe('Model Steering Integration', () => {
     await rig.type('Start long task');
     await rig.pressEnter();
 
-    // Wait for the model to call 'list_directory' (Confirming state)
-    await rig.waitForOutput('ReadFolder');
+    // Wait for the first tool confirmation.
+    const pendingListDirectory =
+      await rig.waitForPendingConfirmation('list_directory');
 
     // Injected a hint while the model is in a tool turn
     await rig.addUserHint('focus on .txt');
 
     // Resolve list_directory (Proceed)
-    await rig.resolveTool('ReadFolder');
+    await rig.resolveTool(pendingListDirectory);
 
     // Then it should proceed with the next action
     await rig.waitForOutput(
       /Since you want me to focus on .txt files,[\s\S]*I will read file1.txt/,
     );
-    await rig.waitForOutput('ReadFile');
+    const pendingReadFile = await rig.waitForPendingConfirmation('read_file');
 
     // Resolve read_file (Proceed)
-    await rig.resolveTool('ReadFile');
+    await rig.resolveTool(pendingReadFile);
 
     // Wait for final completion
     await rig.waitForOutput('Task complete.');

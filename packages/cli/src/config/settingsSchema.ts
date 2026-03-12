@@ -803,6 +803,146 @@ const SETTINGS_SCHEMA = {
           },
         },
       },
+      voiceAssistant: {
+        type: 'object',
+        label: 'Voice Assistant',
+        category: 'UI',
+        requiresRestart: false,
+        default: {},
+        description: 'Advanced runtime configuration for voice assistant mode.',
+        showInDialog: false,
+        properties: {
+          persona: {
+            type: 'string',
+            label: 'Voice Persona',
+            category: 'UI',
+            requiresRestart: false,
+            default: undefined as string | undefined,
+            description:
+              'Selected Google Live API prebuilt voice persona for assistant speech.',
+            showInDialog: false,
+          },
+          model: {
+            type: 'string',
+            label: 'Voice Model',
+            category: 'UI',
+            requiresRestart: false,
+            default: undefined as string | undefined,
+            description:
+              'Live model ID used for voice sessions. Defaults to the built-in voice model when unset.',
+            showInDialog: false,
+          },
+          inputTranscriptionLanguageCode: {
+            type: 'string',
+            label: 'Voice Input Language Code',
+            category: 'UI',
+            requiresRestart: false,
+            default: undefined as string | undefined,
+            description:
+              'Optional voice input language hint. Reserved for future Live backend support and currently not sent.',
+            showInDialog: false,
+          },
+          forceTurnEndOnSilence: {
+            type: 'boolean',
+            label: 'Force Turn End On Silence',
+            category: 'UI',
+            requiresRestart: false,
+            default: true,
+            description:
+              'Force client-side turn-end commits when sustained silence is detected.',
+            showInDialog: false,
+          },
+          turnEndSilenceMs: {
+            type: 'number',
+            label: 'Turn End Silence (ms)',
+            category: 'UI',
+            requiresRestart: false,
+            default: 1600,
+            description:
+              'Silence duration threshold before committing a turn on the client.',
+            showInDialog: false,
+          },
+          maxSpeechSegmentMs: {
+            type: 'number',
+            label: 'Max Speech Segment (ms)',
+            category: 'UI',
+            requiresRestart: false,
+            default: 9000,
+            description:
+              'Maximum continuous speech duration before forcing a client turn commit.',
+            showInDialog: false,
+          },
+          transcriptTurnFallback: {
+            type: 'boolean',
+            label: 'Transcript Turn Fallback',
+            category: 'UI',
+            requiresRestart: false,
+            default: false,
+            description:
+              'When enabled, sends transcript fallback text turns after audio commits.',
+            showInDialog: false,
+          },
+          transcriptTurnCooldownMs: {
+            type: 'number',
+            label: 'Transcript Fallback Cooldown (ms)',
+            category: 'UI',
+            requiresRestart: false,
+            default: 4000,
+            description: 'Cooldown between transcript fallback submissions.',
+            showInDialog: false,
+          },
+          localAssistantFallback: {
+            type: 'boolean',
+            label: 'Local Assistant Fallback',
+            category: 'UI',
+            requiresRestart: false,
+            default: false,
+            description:
+              'When enabled, locally forwards transcript requests if model output is delayed.',
+            showInDialog: false,
+          },
+          localAssistantFallbackMs: {
+            type: 'number',
+            label: 'Local Assistant Fallback Timeout (ms)',
+            category: 'UI',
+            requiresRestart: false,
+            default: 3200,
+            description:
+              'Timeout used for local transcript fallback submission.',
+            showInDialog: false,
+          },
+          advancedVad: {
+            type: 'boolean',
+            label: 'Advanced VAD Config',
+            category: 'UI',
+            requiresRestart: false,
+            default: false,
+            description:
+              'Enable advanced server-side VAD/proactivity parameters for live sessions.',
+            showInDialog: false,
+          },
+          serverSilenceMs: {
+            type: 'number',
+            label: 'Server Silence (ms)',
+            category: 'UI',
+            requiresRestart: false,
+            default: 1600,
+            description:
+              'Server-side silence threshold used with advanced VAD config.',
+            showInDialog: false,
+          },
+          setupWaitMs: {
+            type: 'number',
+            label: 'Setup Wait (ms)',
+            category: 'UI',
+            requiresRestart: false,
+            default: 1500,
+            description:
+              'Time to wait for setupComplete before allowing audio stream bypass.',
+            showInDialog: false,
+          },
+        },
+      },
     },
   },
 

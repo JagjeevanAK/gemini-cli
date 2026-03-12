@@ -50,7 +50,7 @@ describe('ApprovalModeIndicator', () => {
       <ApprovalModeIndicator approvalMode={ApprovalMode.DEFAULT} />,
     );
     await waitUntilReady();
-    expect(lastFrame()).toMatchSnapshot();
+    expect(lastFrame({ allowEmpty: true })).toBe('');
   });
 
   it('renders correctly for DEFAULT mode with plan enabled', async () => {
@@ -61,6 +61,6 @@ describe('ApprovalModeIndicator', () => {
       />,
     );
     await waitUntilReady();
-    expect(lastFrame()).toMatchSnapshot();
+    expect(lastFrame({ allowEmpty: true })).toBe('');
   });
 });

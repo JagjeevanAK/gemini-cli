@@ -50,7 +50,9 @@ import {
   type GeminiUserTier,
   type UserFeedbackPayload,
   type AgentDefinition,
-  type ApprovalMode,
+  ApprovalMode,
+  type ToolConfirmationPayload,
+  ToolConfirmationOutcome,
   IdeClient,
   ideContextStore,
   getErrorMessage,
@@ -168,6 +170,19 @@ import { useIsHelpDismissKey } from './utils/shortcutsHelp.js';
 import { useSuspend } from './hooks/useSuspend.js';
 import { useRunEventNotifications } from './hooks/useRunEventNotifications.js';
 import { isNotificationsEnabled } from '../utils/terminalNotifications.js';
+import { VoiceAssistantContextProvider } from './contexts/VoiceAssistantContext.js';
+import {
+  useVoiceAssistantController,
+  type ResolvePendingActionRequest,
+  type VoiceAssistantRuntimeConfig,
+} from './hooks/useVoiceAssistantController.js';
+import {
+  buildRuntimeStatusSummary,
+  getVoicePendingActions,
+} from './utils/voiceAssistantState.js';
+import { resolveToolConfirmation } from './utils/toolConfirmationResolver.js';
+import { getPendingAttentionNotification } from './utils/pendingAttentionNotification.js';
+import { voiceDebugLog } from '../services/voiceDebugLogger.js';
 
 function isToolExecuting(pendingHistoryItems: HistoryItemWithoutId[]) {
   return pendingHistoryItems.some((item) => {
@@ -190,6 +205,182 @@ function isToolAwaitingConfirmation(
         (tool) => CoreToolCallStatus.AwaitingApproval === tool.status,
       ),
     );
+}
+
+function sanitizeVoiceAnnouncementText(text: string) {
+  return text
+    .replace(
+      /\[VOICE_AGENT_HANDOFF_V1\][\s\S]*?\[\/VOICE_AGENT_HANDOFF_V1\]/g,
+      '',
+    )
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/^\s*[-*]\s+/gm, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function shortenVoiceSnippet(text: string, maxChars: number) {
+  const trimmed = text.trim();
+  if (trimmed.length <= maxChars) {
+    return trimmed;
+  }
+  return `${trimmed.slice(0, maxChars - 3)}...`;
+}
+
+function extractUniqueFilePaths(text: string): string[] {
+  const matches = text.match(
+    /\b(?:[a-zA-Z0-9._-]+\/)+[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+\b/g,
+  );
+  if (!matches || matches.length === 0) {
+    return [];
+  }
+  return Array.from(new Set(matches));
+}
+
+function formatPathForSpeech(filePath: string) {
+  return filePath.startsWith('src/') ? `from ${filePath}` : `in ${filePath}`;
+}
+
+function buildFriendlyVoiceCompletionSummary(rawText: string): string | null {
+  const cleaned = sanitizeVoiceAnnouncementText(rawText);
+  if (!cleaned) {
+    return null;
+  }
+
+  const normalized = cleaned.toLowerCase();
+  const filePaths = extractUniqueFilePaths(cleaned);
+  const soundsLikeChangeSummary =
+    filePaths.length > 0 &&
+    (normalized.includes('uncommitted') ||
+      normalized.includes('changed') ||
+      normalized.includes('modified') ||
+      normalized.includes('untracked'));
+
+  if (soundsLikeChangeSummary) {
+    if (filePaths.length === 1) {
+      return `I found one changed file ${formatPathForSpeech(filePaths[0])}.`;
+    }
+
+    const preview = filePaths
+      .slice(0, 2)
+      .map(formatPathForSpeech)
+      .join(' and ');
+    return `I found changes in ${filePaths.length} files, including ${preview}.`;
+  }
+
+  if (filePaths.length > 2) {
+    const preview = filePaths
+      .slice(0, 2)
+      .map(formatPathForSpeech)
+      .join(' and ');
+    return `I found ${filePaths.length} relevant files, including ${preview}.`;
+  }
+
+  return shortenVoiceSnippet(cleaned, 260);
+}
+
+function getLatestCompletedToolSummary(history: HistoryItem[]): string | null {
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const item = history[index];
+    if (item.type !== 'tool_group' || item.tools.length === 0) {
+      continue;
+    }
+
+    const completedTool = [...item.tools]
+      .reverse()
+      .find(
+        (tool) =>
+          tool.status === CoreToolCallStatus.Success ||
+          tool.status === CoreToolCallStatus.Error ||
+          tool.status === CoreToolCallStatus.Cancelled,
+      );
+    if (!completedTool) {
+      continue;
+    }
+
+    const baseText = completedTool.description || completedTool.name;
+    const cleaned = sanitizeVoiceAnnouncementText(baseText);
+    if (!cleaned) {
+      continue;
+    }
+    if (
+      completedTool.name === 'run_shell_command' ||
+      cleaned.toLowerCase().startsWith('shell ')
+    ) {
+      const commandMatch = cleaned.match(/^shell\s+(.+?)(?:\s*\[|$)/i);
+      const commandText = commandMatch?.[1]?.trim();
+      if (commandText) {
+        return shortenVoiceSnippet(`the command ${commandText}`, 130);
+      }
+      return 'a shell command';
+    }
+    return shortenVoiceSnippet(cleaned, 130);
+  }
+
+  return null;
+}
+
+function getLatestAssistantTurnText(history: HistoryItem[]): string | null {
+  const collected: string[] = [];
+
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const item = history[index];
+    if (item.type === 'gemini' || item.type === 'gemini_content') {
+      const text = typeof item.text === 'string' ? item.text.trim() : '';
+      if (text) {
+        collected.push(text);
+      }
+      continue;
+    }
+
+    if (collected.length > 0) {
+      break;
+    }
+  }
+
+  if (collected.length === 0) {
+    return null;
+  }
+
+  return collected.reverse().join(' ').replace(/\s+/g, ' ').trim();
+}
+
+function isQuotaOrRateLimitErrorText(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return (
+    normalized.includes('quota') ||
+    normalized.includes('rate limit') ||
+    normalized.includes('generate_content_free_tier_requests') ||
+    normalized.includes('code: 429') ||
+    normalized.includes(' 429')
+  );
+}
+
+function extractRetryDelaySeconds(text: string): number | null {
+  const retryMatch = text.match(/retry in\s+([0-9]+(?:\.[0-9]+)?)s/i);
+  if (!retryMatch?.[1]) {
+    return null;
+  }
+  const parsed = Number.parseFloat(retryMatch[1]);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+}
+
+function extractApiErrorMessage(text: string): string | null {
+  const bracketedApiErrorMatch = text.match(/\[API Error:\s*([^\]]+)\]/i);
+  if (bracketedApiErrorMatch?.[1]) {
+    return bracketedApiErrorMatch[1].trim();
+  }
+
+  const inlineApiErrorMatch = text.match(/api error:\s*(.+)$/i);
+  if (inlineApiErrorMatch?.[1]) {
+    return inlineApiErrorMatch[1].trim();
+  }
+
+  return null;
 }
 
 interface AppContainerProps {
@@ -2125,6 +2316,637 @@ Logging in with Google... Restarting Gemini CLI to continue.
     [pendingHistoryItems],
   );
 
+  const [voiceAssistantEnabled, setVoiceAssistantEnabled] = useState(false);
+  const [voiceAssistantListening, setVoiceAssistantListening] = useState(false);
+  const voiceAssistantRuntimeConfig = useMemo<VoiceAssistantRuntimeConfig>(
+    () => ({
+      persona: settings.merged.ui.voiceAssistant.persona,
+      model: settings.merged.ui.voiceAssistant.model,
+      inputTranscriptionLanguageCode:
+        settings.merged.ui.voiceAssistant.inputTranscriptionLanguageCode,
+      forceTurnEndOnSilence:
+        settings.merged.ui.voiceAssistant.forceTurnEndOnSilence,
+      turnEndSilenceMs: settings.merged.ui.voiceAssistant.turnEndSilenceMs,
+      maxSpeechSegmentMs: settings.merged.ui.voiceAssistant.maxSpeechSegmentMs,
+      transcriptTurnFallback:
+        settings.merged.ui.voiceAssistant.transcriptTurnFallback,
+      transcriptTurnCooldownMs:
+        settings.merged.ui.voiceAssistant.transcriptTurnCooldownMs,
+      localAssistantFallback:
+        settings.merged.ui.voiceAssistant.localAssistantFallback,
+      localAssistantFallbackMs:
+        settings.merged.ui.voiceAssistant.localAssistantFallbackMs,
+      advancedVad: settings.merged.ui.voiceAssistant.advancedVad,
+      serverSilenceMs: settings.merged.ui.voiceAssistant.serverSilenceMs,
+      setupWaitMs: settings.merged.ui.voiceAssistant.setupWaitMs,
+    }),
+    [
+      settings.merged.ui.voiceAssistant.advancedVad,
+      settings.merged.ui.voiceAssistant.forceTurnEndOnSilence,
+      settings.merged.ui.voiceAssistant.inputTranscriptionLanguageCode,
+      settings.merged.ui.voiceAssistant.localAssistantFallback,
+      settings.merged.ui.voiceAssistant.localAssistantFallbackMs,
+      settings.merged.ui.voiceAssistant.maxSpeechSegmentMs,
+      settings.merged.ui.voiceAssistant.model,
+      settings.merged.ui.voiceAssistant.persona,
+      settings.merged.ui.voiceAssistant.serverSilenceMs,
+      settings.merged.ui.voiceAssistant.setupWaitMs,
+      settings.merged.ui.voiceAssistant.transcriptTurnCooldownMs,
+      settings.merged.ui.voiceAssistant.transcriptTurnFallback,
+      settings.merged.ui.voiceAssistant.turnEndSilenceMs,
+    ],
+  );
+  const voiceAssistantContextSync = useMemo(() => {
+    for (
+      let index = historyManager.history.length - 1;
+      index >= 0;
+      index -= 1
+    ) {
+      const item = historyManager.history[index];
+      if (item.type === 'compression' && !item.compression.isPending) {
+        const originalTokenCount = item.compression.originalTokenCount;
+        const newTokenCount = item.compression.newTokenCount;
+        const message =
+          typeof originalTokenCount === 'number' &&
+          typeof newTokenCount === 'number'
+            ? `Conversation context compressed from ${originalTokenCount} tokens to ${newTokenCount} tokens.`
+            : 'Conversation context was compressed.';
+        return {
+          generation: item.id,
+          message,
+        };
+      }
+
+      if (
+        item.type === 'info' &&
+        (item.text.startsWith('Context compressed from ') ||
+          item.text === 'Conversation context has been cleared.')
+      ) {
+        return {
+          generation: item.id,
+          message: item.text,
+        };
+      }
+    }
+
+    return {
+      generation: 0,
+      message: null,
+    };
+  }, [historyManager.history]);
+
+  useEffect(() => {
+    voiceDebugLog('app.voice_debug_probe', {
+      cwd: process.cwd(),
+    });
+  }, []);
+
+  useEffect(() => {
+    voiceDebugLog('app.voice_enabled.changed', {
+      enabled: voiceAssistantEnabled,
+    });
+  }, [voiceAssistantEnabled]);
+
+  useEffect(() => {
+    voiceDebugLog('app.voice_listening.changed', {
+      listening: voiceAssistantListening,
+    });
+  }, [voiceAssistantListening]);
+
+  const toggleVoiceAssistant = useCallback(() => {
+    setVoiceAssistantEnabled((prev) => !prev);
+  }, []);
+
+  const enableVoiceAssistant = useCallback(() => {
+    setVoiceAssistantEnabled(true);
+  }, []);
+
+  const disableVoiceAssistant = useCallback(() => {
+    setVoiceAssistantListening(false);
+    setVoiceAssistantEnabled(false);
+  }, []);
+
+  const setVoiceAssistantListeningState = useCallback((listening: boolean) => {
+    setVoiceAssistantListening(listening);
+    if (listening) {
+      setVoiceAssistantEnabled(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!voiceAssistantEnabled) {
+      setVoiceAssistantListening(false);
+    }
+  }, [voiceAssistantEnabled]);
+
+  const getPendingVoiceActions = useCallback(
+    () =>
+      getVoicePendingActions({
+        pendingHistoryItems,
+        commandConfirmationRequest,
+        authConsentRequest,
+        permissionConfirmationRequest,
+        hasConfirmUpdateExtensionRequests,
+        hasLoopDetectionConfirmationRequest,
+      }),
+    [
+      pendingHistoryItems,
+      commandConfirmationRequest,
+      authConsentRequest,
+      permissionConfirmationRequest,
+      hasConfirmUpdateExtensionRequests,
+      hasLoopDetectionConfirmationRequest,
+    ],
+  );
+
+  const getRuntimeVoiceStatus = useCallback(
+    () =>
+      buildRuntimeStatusSummary({
+        streamingState,
+        pendingHistoryItems,
+        commandConfirmationRequest,
+        authConsentRequest,
+        permissionConfirmationRequest,
+        hasConfirmUpdateExtensionRequests,
+        hasLoopDetectionConfirmationRequest,
+        thoughtSubject: thought?.subject || null,
+        history: historyManager.history,
+      }),
+    [
+      streamingState,
+      pendingHistoryItems,
+      commandConfirmationRequest,
+      authConsentRequest,
+      permissionConfirmationRequest,
+      hasConfirmUpdateExtensionRequests,
+      hasLoopDetectionConfirmationRequest,
+      thought,
+      historyManager.history,
+    ],
+  );
+
+  const isVoiceAgentBusy = useCallback(
+    () =>
+      streamingState === StreamingState.Responding ||
+      isToolExecuting(pendingHistoryItems) ||
+      hasPendingActionRequired,
+    [streamingState, pendingHistoryItems, hasPendingActionRequired],
+  );
+
+  const submitVoiceHint = useCallback(
+    (hint: string) => {
+      const trimmed = hint.trim();
+      if (!trimmed) {
+        return 'I did not catch that update clearly. Can you repeat it?';
+      }
+      (
+        config.userHintService as {
+          addUserHint: (
+            hintText: string,
+            options?: { force?: boolean },
+          ) => void;
+        }
+      ).addUserHint(trimmed, { force: true });
+      historyManager.addItem({
+        type: 'hint',
+        text: trimmed,
+      });
+      return 'Got it. I shared that with the running agent.';
+    },
+    [config, historyManager],
+  );
+
+  const submitVoiceUserRequest = useCallback(
+    async (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed) {
+        return 'I did not catch a clear request yet.';
+      }
+
+      const isAgentRunning =
+        streamingState === StreamingState.Responding ||
+        isToolExecuting(pendingHistoryItems);
+
+      if (isAgentRunning) {
+        submitVoiceHint(trimmed);
+        return 'Perfect. I added that while the current run keeps going.';
+      }
+
+      // Submit the spoken request through the same path as keyboard + Enter
+      // so UI/input behavior stays identical.
+      await handleFinalSubmit(trimmed);
+      return "On it. I'll check that and report back.";
+    },
+    [streamingState, pendingHistoryItems, submitVoiceHint, handleFinalSubmit],
+  );
+
+  const resolveVoicePendingAction = useCallback(
+    async (request: ResolvePendingActionRequest) => {
+      const pendingActions = getPendingVoiceActions();
+      if (pendingActions.length === 0) {
+        return 'No approvals are waiting right now.';
+      }
+
+      const targetAction = request.actionId
+        ? pendingActions.find((action) => action.id === request.actionId)
+        : pendingActions[0];
+      if (!targetAction) {
+        return `I could not find that pending action: "${request.actionId}".`;
+      }
+
+      const decision = request.decision.trim().toLowerCase();
+      if (!targetAction.allowedDecisions.includes(decision)) {
+        return `That choice is not valid here. You can say: ${targetAction.allowedDecisions.join(', ')}.`;
+      }
+
+      if (targetAction.type === 'tool') {
+        const toolCall = allToolCalls.find(
+          (tool) => tool.callId === targetAction.toolCallId,
+        );
+        if (!toolCall) {
+          return 'I could not find the pending tool confirmation.';
+        }
+
+        const details = toolCall.confirmationDetails;
+        let outcome: ToolConfirmationOutcome | null = null;
+        let payload: ToolConfirmationPayload | undefined;
+
+        if (details?.type === 'ask_user') {
+          if (decision === 'cancel') {
+            outcome = ToolConfirmationOutcome.Cancel;
+          } else {
+            outcome = ToolConfirmationOutcome.ProceedOnce;
+            payload = {
+              answers: request.answers ?? {},
+            };
+          }
+        } else if (details?.type === 'exit_plan_mode') {
+          if (decision === 'implement_auto_edit') {
+            outcome = ToolConfirmationOutcome.ProceedOnce;
+            payload = {
+              approved: true,
+              approvalMode: ApprovalMode.AUTO_EDIT,
+            };
+          } else if (decision === 'implement_manual') {
+            outcome = ToolConfirmationOutcome.ProceedOnce;
+            payload = {
+              approved: true,
+              approvalMode: ApprovalMode.DEFAULT,
+            };
+          } else if (decision === 'stay_in_plan') {
+            outcome = ToolConfirmationOutcome.ProceedOnce;
+            payload = {
+              approved: false,
+              feedback: request.feedback,
+            };
+          } else if (decision === 'cancel') {
+            outcome = ToolConfirmationOutcome.Cancel;
+          }
+        } else {
+          switch (decision) {
+            case 'allow_once':
+              outcome = ToolConfirmationOutcome.ProceedOnce;
+              break;
+            case 'allow_session':
+              outcome = ToolConfirmationOutcome.ProceedAlways;
+              break;
+            case 'allow_always':
+              outcome = ToolConfirmationOutcome.ProceedAlwaysAndSave;
+              break;
+            case 'allow_tool_session':
+              outcome = ToolConfirmationOutcome.ProceedAlwaysTool;
+              break;
+            case 'allow_server_session':
+              outcome = ToolConfirmationOutcome.ProceedAlwaysServer;
+              break;
+            case 'modify':
+              outcome = ToolConfirmationOutcome.ModifyWithEditor;
+              break;
+            case 'cancel':
+              outcome = ToolConfirmationOutcome.Cancel;
+              break;
+            default:
+              break;
+          }
+        }
+
+        if (!outcome) {
+          return `I could not apply "${decision}" to that tool request.`;
+        }
+
+        const result = await resolveToolConfirmation({
+          config,
+          toolCalls: allToolCalls,
+          callId: toolCall.callId,
+          outcome,
+          payload,
+        });
+        if (result !== 'resolved') {
+          return 'I could not resolve that tool action.';
+        }
+        switch (decision) {
+          case 'allow_once':
+            return 'Okay, running it now.';
+          case 'allow_session':
+            return 'Okay, approved for this session.';
+          case 'allow_always':
+            return 'Okay, approved always for this command.';
+          case 'allow_tool_session':
+            return 'Okay, approved this tool for this session.';
+          case 'allow_server_session':
+            return 'Okay, approved this server for this session.';
+          case 'modify':
+            return "Okay, let's modify it before running.";
+          case 'cancel':
+            return 'Okay, denied. I will not run it.';
+          case 'answer':
+            return 'Got it. I sent your answer.';
+          default:
+            return 'Done. I applied your decision.';
+        }
+      }
+
+      if (targetAction.type === 'command') {
+        const confirmed = decision === 'allow';
+        commandConfirmationRequest?.onConfirm(confirmed);
+        return confirmed
+          ? 'Okay, approved. Running it now.'
+          : 'Okay, denied. I will not run it.';
+      }
+
+      if (targetAction.type === 'auth') {
+        const confirmed = decision === 'allow';
+        authConsentRequest?.onConfirm(confirmed);
+        return confirmed
+          ? 'Okay, approved the authentication request.'
+          : 'Okay, denied the authentication request.';
+      }
+
+      if (targetAction.type === 'permission') {
+        permissionConfirmationRequest?.onComplete({
+          allowed: decision === 'allow',
+        });
+        return decision === 'allow'
+          ? 'Okay, approved. Continuing with filesystem access.'
+          : 'Okay, denied filesystem access.';
+      }
+
+      if (targetAction.type === 'extension_update') {
+        const requestHead = confirmUpdateExtensionRequests[0];
+        requestHead?.onConfirm(decision === 'allow');
+        return decision === 'allow'
+          ? 'Okay, approved that extension update.'
+          : 'Okay, denied that extension update.';
+      }
+
+      if (targetAction.type === 'loop_detection') {
+        loopDetectionConfirmationRequest?.onComplete({
+          userSelection: decision === 'disable' ? 'disable' : 'keep',
+        });
+        return decision === 'disable'
+          ? 'Okay, disabled loop detection and continued.'
+          : 'Okay, kept loop detection enabled.';
+      }
+
+      return 'Unsupported pending action type.';
+    },
+    [
+      getPendingVoiceActions,
+      allToolCalls,
+      config,
+      commandConfirmationRequest,
+      authConsentRequest,
+      permissionConfirmationRequest,
+      confirmUpdateExtensionRequests,
+      loopDetectionConfirmationRequest,
+    ],
+  );
+
+  const voiceAssistantController = useVoiceAssistantController({
+    config,
+    enabled: voiceAssistantEnabled,
+    captureAudio: voiceAssistantListening,
+    runtimeConfig: voiceAssistantRuntimeConfig,
+    contextSyncGeneration: voiceAssistantContextSync.generation,
+    contextSyncMessage: voiceAssistantContextSync.message,
+    isAgentBusy: isVoiceAgentBusy,
+    onDisableRequested: disableVoiceAssistant,
+    getRuntimeStatus: getRuntimeVoiceStatus,
+    getLatestHistoryId: () => uiState.history.at(-1)?.id ?? 0,
+    getPendingActions: getPendingVoiceActions,
+    submitUserRequest: submitVoiceUserRequest,
+    submitUserHint: submitVoiceHint,
+    resolvePendingAction: resolveVoicePendingAction,
+    cancelCurrentRun: cancelOngoingRequest,
+  });
+  const voiceConnectionState = voiceAssistantController.connectionState;
+  const speakVoiceAnnouncement = voiceAssistantController.speak;
+
+  const voiceAssistantAttentionNotification = useMemo(
+    () =>
+      getPendingAttentionNotification(
+        pendingHistoryItems,
+        commandConfirmationRequest,
+        authConsentRequest,
+        permissionConfirmationRequest,
+        hasConfirmUpdateExtensionRequests,
+        hasLoopDetectionConfirmationRequest,
+      ),
+    [
+      pendingHistoryItems,
+      commandConfirmationRequest,
+      authConsentRequest,
+      permissionConfirmationRequest,
+      hasConfirmUpdateExtensionRequests,
+      hasLoopDetectionConfirmationRequest,
+    ],
+  );
+
+  const latestVoiceCompletionSummary = useMemo(() => {
+    const latestTurnText = getLatestAssistantTurnText(historyManager.history);
+    if (!latestTurnText) {
+      return null;
+    }
+
+    return buildFriendlyVoiceCompletionSummary(latestTurnText);
+  }, [historyManager.history]);
+  const latestVoiceToolSummary = useMemo(
+    () => getLatestCompletedToolSummary(historyManager.history),
+    [historyManager.history],
+  );
+
+  const latestVoiceCompletionSummaryRef = useRef<string | null>(
+    latestVoiceCompletionSummary,
+  );
+  const latestVoiceToolSummaryRef = useRef<string | null>(
+    latestVoiceToolSummary,
+  );
+  useEffect(() => {
+    latestVoiceCompletionSummaryRef.current = latestVoiceCompletionSummary;
+    latestVoiceToolSummaryRef.current = latestVoiceToolSummary;
+  }, [latestVoiceCompletionSummary, latestVoiceToolSummary]);
+
+  const lastVoiceAttentionKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!voiceAssistantEnabled || voiceConnectionState !== 'connected') {
+      lastVoiceAttentionKeyRef.current = null;
+      return;
+    }
+
+    if (!voiceAssistantAttentionNotification) {
+      lastVoiceAttentionKeyRef.current = null;
+      return;
+    }
+
+    if (
+      lastVoiceAttentionKeyRef.current ===
+      voiceAssistantAttentionNotification.key
+    ) {
+      return;
+    }
+
+    lastVoiceAttentionKeyRef.current = voiceAssistantAttentionNotification.key;
+    const event = voiceAssistantAttentionNotification.event;
+    const heading =
+      event.type === 'attention'
+        ? event.heading || 'Action required'
+        : 'Notice';
+    const detail = event.detail || 'Please check the terminal.';
+    speakVoiceAnnouncement(`${heading}. ${detail}`);
+  }, [
+    voiceAssistantEnabled,
+    voiceConnectionState,
+    speakVoiceAnnouncement,
+    voiceAssistantAttentionNotification,
+  ]);
+
+  const lastVoiceErrorAnnouncementRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!voiceAssistantEnabled || voiceConnectionState !== 'connected') {
+      return;
+    }
+
+    let latestErrorText: string | null = null;
+    for (
+      let index = historyManager.history.length - 1;
+      index >= 0;
+      index -= 1
+    ) {
+      const item = historyManager.history[index];
+      if (item.type === MessageType.ERROR) {
+        latestErrorText = item.text;
+        break;
+      }
+    }
+    if (!latestErrorText) {
+      return;
+    }
+
+    if (lastVoiceErrorAnnouncementRef.current === latestErrorText) {
+      return;
+    }
+    lastVoiceErrorAnnouncementRef.current = latestErrorText;
+
+    const apiErrorMessage = extractApiErrorMessage(latestErrorText);
+    if (apiErrorMessage) {
+      if (isQuotaOrRateLimitErrorText(latestErrorText)) {
+        const retryDelaySeconds = extractRetryDelaySeconds(latestErrorText);
+        const retryHint = retryDelaySeconds
+          ? ` Please retry in about ${Math.max(1, Math.ceil(retryDelaySeconds))} seconds.`
+          : ' Please wait a bit and try again.';
+        speakVoiceAnnouncement(`API error. ${apiErrorMessage}.${retryHint}`);
+        return;
+      }
+
+      speakVoiceAnnouncement(`API error. ${apiErrorMessage}.`);
+      return;
+    }
+
+    if (isQuotaOrRateLimitErrorText(latestErrorText)) {
+      const retryDelaySeconds = extractRetryDelaySeconds(latestErrorText);
+      const retryHint = retryDelaySeconds
+        ? ` Please retry in about ${Math.max(1, Math.ceil(retryDelaySeconds))} seconds.`
+        : ' Please wait a bit and try again.';
+      speakVoiceAnnouncement(
+        `I hit API quota limits for the coding model.${retryHint}`,
+      );
+    }
+  }, [
+    historyManager.history,
+    voiceAssistantEnabled,
+    voiceConnectionState,
+    speakVoiceAnnouncement,
+  ]);
+
+  const previousStreamingStateForVoiceRef = useRef(streamingState);
+  const completionAnnouncementTimerRef = useRef<NodeJS.Timeout | null>(null);
+  useEffect(
+    () => () => {
+      if (completionAnnouncementTimerRef.current) {
+        clearTimeout(completionAnnouncementTimerRef.current);
+      }
+    },
+    [],
+  );
+  useEffect(() => {
+    const previousState = previousStreamingStateForVoiceRef.current;
+    previousStreamingStateForVoiceRef.current = streamingState;
+
+    if (!voiceAssistantEnabled || voiceConnectionState !== 'connected') {
+      return;
+    }
+
+    const justStartedTurn =
+      previousState === StreamingState.Idle &&
+      streamingState === StreamingState.Responding;
+    if (justStartedTurn) {
+      if (completionAnnouncementTimerRef.current) {
+        clearTimeout(completionAnnouncementTimerRef.current);
+        completionAnnouncementTimerRef.current = null;
+      }
+      const recentlyNarrated =
+        Date.now() - voiceAssistantController.lastOutputAt < 1800;
+      if (!recentlyNarrated) {
+        speakVoiceAnnouncement('Started working on your request.');
+      }
+      return;
+    }
+
+    const justCompletedTurn =
+      previousState === StreamingState.Responding &&
+      streamingState === StreamingState.Idle;
+    if (!justCompletedTurn || hasPendingActionRequired) {
+      return;
+    }
+    if (completionAnnouncementTimerRef.current) {
+      clearTimeout(completionAnnouncementTimerRef.current);
+    }
+    completionAnnouncementTimerRef.current = setTimeout(() => {
+      completionAnnouncementTimerRef.current = null;
+      const completionSummary = latestVoiceCompletionSummaryRef.current;
+      const toolSummary = latestVoiceToolSummaryRef.current;
+      const summaryParts = ['Done.'];
+      if (toolSummary) {
+        summaryParts.push(`I ran ${toolSummary}.`);
+      }
+      if (completionSummary) {
+        summaryParts.push(completionSummary);
+      }
+      if (!completionSummary && !toolSummary) {
+        summaryParts.push('The coding run is complete.');
+      }
+      const completionText = summaryParts.join(' ').replace(/\s+/g, ' ').trim();
+      speakVoiceAnnouncement(completionText);
+    }, 250);
+  }, [
+    streamingState,
+    hasPendingActionRequired,
+    voiceAssistantEnabled,
+    voiceConnectionState,
+    speakVoiceAnnouncement,
+    voiceAssistantController.lastOutputAt,
+  ]);
+
   const [geminiMdFileCount, setGeminiMdFileCount] = useState<number>(
     config.getGeminiMdFileCount(),
   );
@@ -2594,11 +3416,33 @@ Logging in with Google... Restarting Gemini CLI to continue.
               startupWarnings: props.startupWarnings || [],
             }}
           >
-            <ToolActionsProvider config={config} toolCalls={allToolCalls}>
-              <ShellFocusContext.Provider value={isFocused}>
-                <App key={`app-${forceRerenderKey}`} />
-              </ShellFocusContext.Provider>
-            </ToolActionsProvider>
+            <VoiceAssistantContextProvider
+              value={{
+                enabled: voiceAssistantEnabled,
+                listening: voiceAssistantListening,
+                enable: enableVoiceAssistant,
+                toggle: toggleVoiceAssistant,
+                disable: disableVoiceAssistant,
+                setListening: setVoiceAssistantListeningState,
+                connectionState: voiceAssistantController.connectionState,
+                inputTranscript: voiceAssistantController.inputTranscript,
+                outputTranscript: voiceAssistantController.outputTranscript,
+                outputHistory: voiceAssistantController.outputHistory,
+                assistantSpeaking: voiceAssistantController.assistantSpeaking,
+                outputLevel: voiceAssistantController.outputLevel,
+                model: voiceAssistantController.model,
+                error: voiceAssistantController.error,
+                playbackWarning: voiceAssistantController.playbackWarning,
+                speak: voiceAssistantController.speak,
+                lastOutputAt: voiceAssistantController.lastOutputAt,
+              }}
+            >
+              <ToolActionsProvider config={config} toolCalls={allToolCalls}>
+                <ShellFocusContext.Provider value={isFocused}>
+                  <App key={`app-${forceRerenderKey}`} />
+                </ShellFocusContext.Provider>
+              </ToolActionsProvider>
+            </VoiceAssistantContextProvider>
           </AppContext.Provider>
         </ConfigContext.Provider>
       </UIActionsContext.Provider>

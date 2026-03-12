@@ -15,30 +15,12 @@ import {
 import {
   IdeClient,
   ToolConfirmationOutcome,
-  MessageBusType,
   type Config,
   type ToolConfirmationPayload,
-  type SerializableConfirmationDetails,
   debugLogger,
 } from '@google/gemini-cli-core';
 import type { IndividualToolCallDisplay } from '../types.js';
-
-type LegacyConfirmationDetails = SerializableConfirmationDetails & {
-  onConfirm: (
-    outcome: ToolConfirmationOutcome,
-    payload?: ToolConfirmationPayload,
-  ) => Promise<void>;
-};
-
-function hasLegacyCallback(
-  details: SerializableConfirmationDetails | undefined,
-): details is LegacyConfirmationDetails {
-  return (
-    !!details &&
-    'onConfirm' in details &&
-    typeof details.onConfirm === 'function'
-  );
-}
+import { resolveToolConfirmation } from '../utils/toolConfirmationResolver.js';
 
 interface ToolActionsContextValue {
   confirm: (
@@ -111,47 +93,15 @@ export const ToolActionsProvider: React.FC<ToolActionsProviderProps> = (
       outcome: ToolConfirmationOutcome,
       payload?: ToolConfirmationPayload,
     ) => {
-      const tool = toolCalls.find((t) => t.callId === callId);
-      if (!tool) {
-        debugLogger.warn(`ToolActions: Tool ${callId} not found`);
-        return;
-      }
-
-      const details = tool.confirmationDetails;
-
-      // 1. Handle Side Effects (IDE Diff)
-      if (
-        details?.type === 'edit' &&
-        isDiffingEnabled &&
-        'filePath' in details // Check for safety
-      ) {
-        const cliOutcome =
-          outcome === ToolConfirmationOutcome.Cancel ? 'rejected' : 'accepted';
-        await ideClient?.resolveDiffFromCli(details.filePath, cliOutcome);
-      }
-
-      // 2. Dispatch via Event Bus
-      if (tool.correlationId) {
-        await config.getMessageBus().publish({
-          type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
-          correlationId: tool.correlationId,
-          confirmed: outcome !== ToolConfirmationOutcome.Cancel,
-          requiresUserConfirmation: false,
-          outcome,
-          payload,
-        });
-        return;
-      }
-
-      // 3. Fallback: Legacy Callback
-      if (hasLegacyCallback(details)) {
-        await details.onConfirm(outcome, payload);
-        return;
-      }
-
-      debugLogger.warn(
-        `ToolActions: No correlationId or callback for ${callId}`,
-      );
+      await resolveToolConfirmation({
+        config,
+        toolCalls,
+        callId,
+        outcome,
+        payload,
+        ideClient,
+        isDiffingEnabled,
+      });
     },
     [config, ideClient, toolCalls, isDiffingEnabled],
   );

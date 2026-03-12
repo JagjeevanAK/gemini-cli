@@ -1063,6 +1063,10 @@ export const useGeminiStream = (
           'Response stopped due to unexpected tool call.',
         [FinishReason.IMAGE_PROHIBITED_CONTENT]:
           'Response stopped due to prohibited image content.',
+        [FinishReason.IMAGE_RECITATION]:
+          'Response stopped due to image recitation policy.',
+        [FinishReason.IMAGE_OTHER]:
+          'Response stopped for other image-generation reasons.',
         [FinishReason.NO_IMAGE]:
           'Response stopped because no image was generated.',
       };

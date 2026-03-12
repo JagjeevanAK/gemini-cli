@@ -15,6 +15,15 @@ describe('UserHintService', () => {
     expect(service.getLatestHintIndex()).toBe(-1);
   });
 
+  it('allows forced hints even when service is disabled', () => {
+    const service = new UserHintService(() => false);
+
+    service.addUserHint('forced hint', { force: true });
+
+    expect(service.getUserHints()).toEqual(['forced hint']);
+    expect(service.getLatestHintIndex()).toBe(0);
+  });
+
   it('stores trimmed hints and exposes them via indexing when enabled', () => {
     const service = new UserHintService(() => true);
 

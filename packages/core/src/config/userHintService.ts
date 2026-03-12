@@ -16,8 +16,8 @@ export class UserHintService {
   /**
    * Adds a new steering hint from the user.
    */
-  addUserHint(hint: string): void {
-    if (!this.isEnabled()) {
+  addUserHint(hint: string, options?: { force?: boolean }): void {
+    if (!this.isEnabled() && !options?.force) {
       return;
     }
     const trimmed = hint.trim();

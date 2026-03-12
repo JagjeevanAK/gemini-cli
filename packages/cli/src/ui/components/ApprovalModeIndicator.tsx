@@ -49,7 +49,6 @@ export const ApprovalModeIndicator: React.FC<ApprovalModeIndicatorProps> = ({
     default:
       textColor = theme.text.accent;
       textContent = '';
-      subText = `${cycleHint} to accept edits`;
       break;
   }
 
